@@ -1,0 +1,9 @@
+[submodule "src/extern/hercules-file-player"]
+	path = src/extern/hercules-file-player
+	url = https://github.com/hanjun815/HeRCULES_file_player.git
+[submodule "src/extern/livox-ros2"]
+	path = src/extern/livox-ros2
+	url = https://github.com/Livox-SDK/livox_ros_driver2.git
+[submodule "src/extern/livox-sdk2"]
+	path = src/extern/livox-sdk2
+	url = https://github.com/Livox-SDK/Livox-SDK2.git
