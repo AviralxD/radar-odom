@@ -1,0 +1,10 @@
+radom:
+  ros__parameters:
+    radar_topic: "/continental/points"
+    imu_topic: "/imu/data_raw"
+    odom_topic: "/radom/odom"
+    odom_frame: "odom"
+    base_frame: "base_link"
+    publish_tf: true
+    doppler_field: "v"
+    rcs_field: "rcs"
