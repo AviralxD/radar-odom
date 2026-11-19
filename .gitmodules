@@ -7,3 +7,6 @@
 [submodule "src/extern/livox-sdk2"]
 	path = src/extern/livox-sdk2
 	url = https://github.com/Livox-SDK/Livox-SDK2.git
+[submodule "src/extern/ransac-lib"]
+	path = src/extern/ransac-lib
+	url = https://github.com/tsattler/RansacLib.git

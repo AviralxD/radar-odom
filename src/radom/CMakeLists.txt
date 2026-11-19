@@ -14,16 +14,20 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 
+set(RANSACLIB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../extern/ransac-lib")
+
 add_executable(radom_node
   src/main.cc
   src/radom_node.cc
   src/odom.cc
+  src/ransac.cc
 )
 
 target_include_directories(radom_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${EIGEN3_INCLUDE_DIRS}
+  ${RANSACLIB_INCLUDE_DIR}
 )
 
 ament_target_dependencies(radom_node
