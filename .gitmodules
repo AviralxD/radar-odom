@@ -10,3 +10,9 @@
 [submodule "src/extern/ransac-lib"]
 	path = src/extern/ransac-lib
 	url = https://github.com/tsattler/RansacLib.git
+[submodule "src/extern/manif"]
+	path = src/extern/manif
+	url = https://github.com/artivis/manif.git
+[submodule "src/extern/kalmanif"]
+	path = src/extern/kalmanif
+	url = https://github.com/artivis/kalmanif.git

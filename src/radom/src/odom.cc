@@ -9,29 +9,35 @@ namespace radom {
 std::optional<OdometryState> OdometryEstimator::process(
     const RadarScan &scan,
     const std::vector<ImuMeasurement> &imu_batch) {
+  (void)imu_batch;
   state_.stamp_ns = scan.stamp_ns;
 
+  // 1. RANSAC Filtering of stationary RADAR points
+  const auto inliers = filterStationaryPoints(scan.points);
+
+  // 2. LSQ estimation of ego velocity
+  const auto vel_est = estimateEgoVelocity(inliers);
+
+  // 3. Velocity integration to find position
   if (!initialized_) {
     last_scan_time_ = scan.timestamp;
     initialized_ = true;
+    integrateVelocity(vel_est, 0.0);
     return state_;
   }
 
   const double dt = scan.timestamp - last_scan_time_;
   last_scan_time_ = scan.timestamp;
-  if (dt <= 0.0) {
+  if (dt <= 0.0 || dt > 1.0) {
+    has_valid_vel_ = false;
     return std::nullopt;
   }
 
-  // 1. RANSAC Filtering of stationary RADAR points
-  const auto inliers = filterStationaryPoints(scan.points);
+  integrateVelocity(vel_est, dt);
 
-  /* TODO:
-   *   2. LSQ estimation of ego velocity
-   *   3. Velocity integration to find position
-   *   4. EKF with IMU data, integrate to find position
-   *   5. GNC filtering instead of RANSAC
-   */
+  // TODO:
+  // 4. Kalman filtering with IMU data
+  // 5. GNC outlier rejection
   (void)inliers;
   (void)imu_batch;
 
@@ -112,6 +118,87 @@ std::vector<RadarPoint> OdometryEstimator::filterStationaryPoints(
     }
   }
   return inliers;
+}
+
+VelocityEstimate OdometryEstimator::estimateEgoVelocity(
+  const std::vector<RadarPoint> &inliers,
+  double doppler_sign,
+  double lambda_z,
+  double huber_delta,
+  int irls_iters) 
+{
+  VelocityEstimate est;
+  const int n = static_cast<int>(inliers.size());
+  if (n < 3) return est;
+
+  Eigen::MatrixX3d U(n, 3);
+  Eigen::VectorXd y(n);
+  for (int i = 0; i < n; ++i) {
+    const Eigen::Vector3d p(inliers[i].x, inliers[i].y, inliers[i].z);
+    const double norm = p.norm();
+    if (norm <= 1e-6) return est;
+    U.row(i) = (p / norm).transpose();
+    y(i) = doppler_sign * static_cast<double>(inliers[i].doppler);
+  }
+
+  Eigen::VectorXd weights = Eigen::VectorXd::Ones(n);
+  const Eigen::Matrix3d reg = Eigen::Vector3d(1e-6, 1e-6, lambda_z).asDiagonal();
+
+  Eigen::LDLT<Eigen::Matrix3d> ldlt;
+  Eigen::VectorXd residuals(n);
+
+  for (int iter = 0; iter <= irls_iters; ++iter) {
+    const Eigen::Matrix3d H = U.transpose() * weights.asDiagonal() * U + reg;
+    const Eigen::Vector3d b = U.transpose() * (weights.array() * y.array()).matrix();
+
+    ldlt.compute(H);
+    if (ldlt.info() != Eigen::Success) return est;
+
+    est.velocity = ldlt.solve(b);
+    residuals = U * est.velocity - y;
+
+    if (iter < irls_iters) {
+      for (int i = 0; i < n; ++i) {
+        const double abs_r = std::abs(residuals(i));
+        weights(i) = (abs_r <= huber_delta) ? 1.0 : (huber_delta / abs_r);
+      }
+    }
+  }
+
+  const double dof = static_cast<double>(std::max(1, n - 3));
+  const double sigma2 = (residuals.array().square() * weights.array()).sum() / dof;
+  est.covariance = std::max(sigma2, 1e-6) * ldlt.solve(Eigen::Matrix3d::Identity());
+  est.valid = true;
+  return est;
+}
+
+void OdometryEstimator::integrateVelocity(
+    const VelocityEstimate &vel_est,
+    double dt) 
+{
+  const Eigen::Matrix3d R_wb = state_.orientation.normalized().toRotationMatrix();
+
+  if (vel_est.valid) {
+    state_.linear_velocity = vel_est.velocity;
+    state_.twist_covariance.topLeftCorner<3, 3>() = vel_est.covariance;
+
+    const Eigen::Vector3d vel_world = R_wb * vel_est.velocity;
+    if (has_valid_vel_) {
+      state_.position += 0.5 * (last_vel_world_ + vel_world) * dt;
+    } else {
+      state_.position += vel_world * dt;
+    }
+    state_.pose_covariance.topLeftCorner<3, 3>() +=
+        R_wb * vel_est.covariance * R_wb.transpose() * (dt * dt);
+
+    last_vel_world_ = vel_world;
+    has_valid_vel_ = true;
+  } else if (has_valid_vel_) {
+    state_.position += last_vel_world_ * dt;
+    const Eigen::Matrix3d cov_body = state_.twist_covariance.topLeftCorner<3, 3>();
+    state_.pose_covariance.topLeftCorner<3, 3>() +=
+        R_wb * cov_body * R_wb.transpose() * (dt * dt);
+  }
 }
 
 }
