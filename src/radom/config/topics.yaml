@@ -2,7 +2,13 @@ radom:
   ros__parameters:
     radar_topic: "/continental/points"
     imu_topic: "/imu/data_raw"
-    odom_topic: "/radom/odom"
+    # Each front-end publishes <output_namespace>/<name>/odom and .../stats.
+    # They run side by side on identical input; the first listed owns the TF.
+    output_namespace: "/radom"
+    frontends: ["ransac", "gnc"]
+    inlier_threshold_mps: 0.15   # RANSAC threshold and GNC noise bound
+    gnc_mu_step: 1.4
+    gnc_max_iterations: 100
     odom_frame: "odom"
     base_frame: "continental"
     publish_tf: true

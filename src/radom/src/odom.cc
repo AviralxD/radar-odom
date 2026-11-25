@@ -2,6 +2,7 @@
 #include "radom/ransac.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 namespace radom {
@@ -56,9 +57,10 @@ std::optional<OdometryState> OdometryEstimator::process(
     has_last_imu_ = true;
   }
 
-  // 2. RANSAC stationary point filtering + IRLS 4D radar ego-velocity estimation
+  // 2. RANSAC or GNC stationary point filtering + IRLS ego-velocity estimation
   const auto inliers = filterStationaryPoints(scan.points);
   const auto vel_est = estimateEgoVelocity(inliers);
+  stats_.velocity = vel_est;
 
   // 3. RIEKF measurement update with lever-arm compensation
   last_update_ = UpdateResult::kInvalid;
@@ -120,38 +122,72 @@ std::vector<RadarPoint> OdometryEstimator::sanitizeScan(
 }
 
 std::vector<RadarPoint> OdometryEstimator::filterStationaryPoints(
-  const std::vector<RadarPoint> &raw_points,
-  double inlier_thresh_mps) 
+  const std::vector<RadarPoint> &raw_points)
 {
   const auto clean_pts = sanitizeScan(raw_points);
+  stats_ = FrontendStats{};
+  stats_.num_points = static_cast<int>(clean_pts.size());
   if (clean_pts.size() < 4) return {};
 
-  RANSAC solver(clean_pts, /*doppler_sign=*/-1.0);
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  const auto start = std::chrono::steady_clock::now();
+  const bool ok = frontend_.type == Frontend::kGnc
+                      ? estimateGnc(clean_pts, &velocity)
+                      : estimateRansac(clean_pts, &velocity);
+  stats_.runtime_us = std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - start).count();
+  if (!ok) return {};
 
-  const double sq_thresh = inlier_thresh_mps * inlier_thresh_mps;
+  // Both front-ends classify inliers by the same rule
+  const double sq_thresh = frontend_.inlier_thresh_mps * frontend_.inlier_thresh_mps;
+  const RANSAC model(clean_pts, /*doppler_sign=*/-1.0);
+  std::vector<RadarPoint> inliers;
+  inliers.reserve(clean_pts.size());
+  for (int i = 0; i < model.num_data(); ++i) {
+    if (model.EvaluateModelOnPoint(velocity, i) < sq_thresh) {
+      inliers.push_back(clean_pts[static_cast<size_t>(i)]);
+    }
+  }
+  stats_.num_inliers = static_cast<int>(inliers.size());
+  return inliers;
+}
+
+bool OdometryEstimator::estimateRansac(
+  const std::vector<RadarPoint> &pts,
+  Eigen::Vector3d *velocity)
+{
+  RANSAC solver(pts, /*doppler_sign=*/-1.0);
+
   ransac_lib::LORansacOptions options;
   options.min_num_iterations_ = 20;
   options.max_num_iterations_ = 250;
-  options.squared_inlier_threshold_ = sq_thresh;
+  options.squared_inlier_threshold_ =
+      frontend_.inlier_thresh_mps * frontend_.inlier_thresh_mps;
 
   ransac_lib::LocallyOptimizedMSAC<
       Eigen::Vector3d,
       std::vector<Eigen::Vector3d>,
       RANSAC> lomsac;
 
-  Eigen::Vector3d best_vel = Eigen::Vector3d::Zero();
   ransac_lib::RansacStatistics stats;
-  const int num_inliers = lomsac.EstimateModel(options, solver, &best_vel, &stats);
-  if (num_inliers < 3) return {};
+  const int num_inliers = lomsac.EstimateModel(options, solver, velocity, &stats);
+  stats_.iterations = static_cast<int>(stats.num_iterations);
+  return num_inliers >= 3;
+}
 
-  std::vector<RadarPoint> inliers;
-  inliers.reserve(static_cast<size_t>(num_inliers));
-  for (int i = 0; i < solver.num_data(); ++i) {
-    if (solver.EvaluateModelOnPoint(best_vel, i) < sq_thresh) {
-      inliers.push_back(clean_pts[static_cast<size_t>(i)]);
-    }
-  }
-  return inliers;
+bool OdometryEstimator::estimateGnc(
+  const std::vector<RadarPoint> &pts,
+  Eigen::Vector3d *velocity)
+{
+  GncOptions options;
+  options.noise_bound = frontend_.inlier_thresh_mps;
+  options.mu_step = frontend_.gnc_mu_step;
+  options.max_iterations = frontend_.gnc_max_iterations;
+
+  const GncResult result = solveGncTls(pts, /*doppler_sign=*/-1.0, options);
+  stats_.iterations = result.iterations;
+  *velocity = result.velocity;
+  return result.valid;
 }
 
 VelocityEstimate OdometryEstimator::estimateEgoVelocity(

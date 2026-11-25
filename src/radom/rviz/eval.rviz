@@ -12,7 +12,7 @@ Visualization Manager:
       Cell Size: 10
       Plane Cell Count: 40
     - Class: rviz_default_plugins/Path
-      Name: Ground truth
+      Name: Ground truth (green)
       Enabled: true
       Color: 60; 220; 90
       Line Style: Billboards
@@ -23,13 +23,24 @@ Visualization Manager:
         Durability Policy: Transient Local
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/Path
-      Name: Estimate
+      Name: RANSAC (red)
       Enabled: true
       Color: 255; 70; 70
       Line Style: Billboards
-      Line Width: 0.4
+      Line Width: 0.8
       Topic:
-        Value: /radom/viz/est_path
+        Value: /radom/viz/ransac/path
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: GNC (blue)
+      Enabled: true
+      Color: 60; 150; 255
+      Line Style: Billboards
+      Line Width: 0.3
+      Topic:
+        Value: /radom/viz/gnc/path
         Depth: 1
         Durability Policy: Transient Local
         Reliability Policy: Reliable
@@ -38,24 +49,36 @@ Visualization Manager:
       Enabled: true
       Color: 60; 220; 90
       Shape: Arrow
-      Shaft Length: 3
-      Shaft Radius: 0.4
-      Head Length: 1.2
-      Head Radius: 0.9
+      Shaft Length: 3.00
+      Shaft Radius: 0.40
+      Head Length: 1.20
+      Head Radius: 0.90
       Topic:
         Value: /radom/viz/gt_pose
         Depth: 5
     - Class: rviz_default_plugins/Pose
-      Name: Estimate now
+      Name: RANSAC now
       Enabled: true
       Color: 255; 70; 70
       Shape: Arrow
-      Shaft Length: 3
-      Shaft Radius: 0.4
-      Head Length: 1.2
-      Head Radius: 0.9
+      Shaft Length: 3.60
+      Shaft Radius: 0.48
+      Head Length: 1.44
+      Head Radius: 1.08
       Topic:
-        Value: /radom/viz/est_pose
+        Value: /radom/viz/ransac/pose
+        Depth: 5
+    - Class: rviz_default_plugins/Pose
+      Name: GNC now
+      Enabled: true
+      Color: 60; 150; 255
+      Shape: Arrow
+      Shaft Length: 2.40
+      Shaft Radius: 0.32
+      Head Length: 0.96
+      Head Radius: 0.72
+      Topic:
+        Value: /radom/viz/gnc/pose
         Depth: 5
   Tools:
     - Class: rviz_default_plugins/MoveCamera

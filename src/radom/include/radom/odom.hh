@@ -4,6 +4,7 @@
 #include <optional>
 #include <vector>
 
+#include "radom/gnc.hh"
 #include "radom/rio_iekf.hh"
 #include "radom/types.hh"
 
@@ -15,9 +16,30 @@ struct VelocityEstimate {
   bool valid = false;
 };
 
+// How stationary points are separated from outliers. Everything downstream
+// (velocity refinement and IEKF) is identical, so the two can be compared.
+enum class Frontend { kRansac, kGnc };
+
+struct FrontendConfig {
+  Frontend type = Frontend::kRansac;
+  double inlier_thresh_mps = 0.15;  // RANSAC threshold and GNC noise bound
+  double gnc_mu_step = 1.4;
+  int gnc_max_iterations = 100;
+};
+
+struct FrontendStats {
+  int num_points = 0;    // points entering the robust estimator
+  int num_inliers = 0;
+  int iterations = 0;    // RANSAC hypotheses, or GNC weighted solves
+  double runtime_us = 0.0;  // robust estimator only
+  VelocityEstimate velocity;  // radar velocity measurement given to the filter
+};
+
 class OdometryEstimator {
 public:
-  explicit OdometryEstimator(const RioConfig &cfg = RioConfig{}) : rio_filter_(cfg) {}
+  explicit OdometryEstimator(const RioConfig &cfg = RioConfig{},
+                             const FrontendConfig &frontend = FrontendConfig{})
+      : frontend_(frontend), rio_filter_(cfg) {}
 
   std::optional<OdometryState> process(
       const RadarScan &scan,
@@ -25,6 +47,7 @@ public:
 
   // Outcome of the radar update in the most recent process() call
   UpdateResult lastUpdate() const { return last_update_; }
+  const FrontendStats &lastStats() const { return stats_; }
 
 private:
   std::vector<RadarPoint> sanitizeScan(
@@ -34,8 +57,11 @@ private:
       double iqr_k = 1.0);
 
   std::vector<RadarPoint> filterStationaryPoints(
-      const std::vector<RadarPoint> &raw_points,
-      double inlier_thresh_mps = 0.15);
+      const std::vector<RadarPoint> &raw_points);
+
+  // Each fills `velocity` with the robust estimate and returns false on failure
+  bool estimateRansac(const std::vector<RadarPoint> &pts, Eigen::Vector3d *velocity);
+  bool estimateGnc(const std::vector<RadarPoint> &pts, Eigen::Vector3d *velocity);
 
   VelocityEstimate estimateEgoVelocity(
       const std::vector<RadarPoint> &inliers,
@@ -46,6 +72,8 @@ private:
 
   void integrateVelocity(const VelocityEstimate &vel_est, double dt);
 
+  FrontendConfig frontend_;
+  FrontendStats stats_;
   RadarInertialFilter rio_filter_;
   UpdateResult last_update_ = UpdateResult::kInvalid;
   OdometryState state_;

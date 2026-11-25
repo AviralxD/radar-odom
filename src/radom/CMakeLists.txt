@@ -5,7 +5,13 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# The front-end runtime comparison is meaningless without optimisation
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+
 find_package(ament_cmake REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -25,6 +31,7 @@ add_executable(radom_node
   src/radom_node.cc
   src/odom.cc
   src/ransac.cc
+  src/gnc.cc
   src/rio_iekf.cc
 )
 
@@ -45,6 +52,7 @@ target_include_directories(radom_node SYSTEM PUBLIC
 
 ament_target_dependencies(radom_node
   rclcpp
+  diagnostic_msgs
   sensor_msgs
   nav_msgs
   geometry_msgs

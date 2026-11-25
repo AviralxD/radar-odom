@@ -70,7 +70,9 @@ bool readable(const sensor_msgs::msg::PointCloud2 &msg, const PointField *field)
 RadomNode::RadomNode() : Node("radom") {
   const auto radar_topic = this->declare_parameter<std::string>("radar_topic", "/continental/points");
   const auto imu_topic = this->declare_parameter<std::string>("imu_topic", "/imu/data_raw");
-  const auto odom_topic = this->declare_parameter<std::string>("odom_topic", "/radom/odom");
+  const auto output_ns = this->declare_parameter<std::string>("output_namespace", "/radom");
+  const auto frontends = this->declare_parameter<std::vector<std::string>>(
+      "frontends", {"ransac", "gnc"});
   odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
   base_frame_ = this->declare_parameter<std::string>("base_frame", "continental");
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
@@ -88,7 +90,31 @@ RadomNode::RadomNode() : Node("radom") {
   rio_config_.nis_gate = this->declare_parameter<double>("nis_gate", rio_config_.nis_gate);
   rio_config_.max_consecutive_rejections = static_cast<int>(this->declare_parameter<int>(
       "max_consecutive_rejections", rio_config_.max_consecutive_rejections));
-  estimator_ = std::make_unique<OdometryEstimator>(rio_config_);
+  FrontendConfig frontend;
+  frontend.inlier_thresh_mps = this->declare_parameter<double>(
+      "inlier_threshold_mps", frontend.inlier_thresh_mps);
+  frontend.gnc_mu_step = this->declare_parameter<double>("gnc_mu_step", frontend.gnc_mu_step);
+  frontend.gnc_max_iterations = static_cast<int>(this->declare_parameter<int>(
+      "gnc_max_iterations", frontend.gnc_max_iterations));
+  if (frontends.empty() || frontend.inlier_thresh_mps <= 0.0 || frontend.gnc_mu_step <= 1.0) {
+    throw std::invalid_argument(
+        "need at least one front-end, inlier_threshold_mps > 0 and gnc_mu_step > 1");
+  }
+  for (const auto &name : frontends) {
+    if (name != "ransac" && name != "gnc") {
+      throw std::invalid_argument("unknown front-end '" + name + "', use ransac or gnc");
+    }
+    Pipeline pipeline;
+    pipeline.name = name;
+    pipeline.config = frontend;
+    pipeline.config.type = name == "gnc" ? Frontend::kGnc : Frontend::kRansac;
+    pipeline.estimator = std::make_unique<OdometryEstimator>(rio_config_, pipeline.config);
+    pipeline.odom_pub = this->create_publisher<nav_msgs::msg::Odometry>(
+        output_ns + "/" + name + "/odom", 50);
+    pipeline.stats_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        output_ns + "/" + name + "/stats", 50);
+    pipelines_.push_back(std::move(pipeline));
+  }
 
   auto sensor_qos = rclcpp::SensorDataQoS();
 
@@ -100,14 +126,15 @@ RadomNode::RadomNode() : Node("radom") {
       imu_topic, rclcpp::SensorDataQoS().keep_last(200),
       std::bind(&RadomNode::imuCallback, this, std::placeholders::_1));
 
-  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 50);
-
   if (publish_tf_) {
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   }
 
-  RCLCPP_INFO(this->get_logger(), "radom started: [%s] + [%s] -> [%s]",
-              radar_topic.c_str(), imu_topic.c_str(), odom_topic.c_str());
+  for (const auto &pipeline : pipelines_) {
+    RCLCPP_INFO(this->get_logger(), "radom started: [%s] + [%s] -> [%s/%s/odom]",
+                radar_topic.c_str(), imu_topic.c_str(), output_ns.c_str(),
+                pipeline.name.c_str());
+  }
 }
 
 void RadomNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
@@ -234,25 +261,73 @@ void RadomNode::processPending() {
     pending_scans_.pop_front();
     const auto imu_batch = takeImuUpTo(scan.stamp_ns);
 
-    try {
-      const auto result = estimator_->process(scan, imu_batch);
-      if (!result) continue;
-      if (estimator_->lastUpdate() == UpdateResult::kRejected) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "radar velocity rejected by the innovation gate");
-      } else if (estimator_->lastUpdate() == UpdateResult::kRecovering) {
-        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                              "repeated rejections, inflating velocity covariance");
-      }
-      publishOdometry(*result);
-    } catch (const std::exception &e) {
-      RCLCPP_ERROR(this->get_logger(), "estimator failed, resetting: %s", e.what());
-      estimator_ = std::make_unique<OdometryEstimator>(rio_config_);
+    // Rotate which front-end runs first, so that warm caches do not
+    // consistently favour one of them in the runtime comparison
+    const size_t count = pipelines_.size();
+    for (size_t k = 0; k < count; ++k) {
+      const size_t i = (scan_count_ + k) % count;
+      // Only one estimator can own the TF: the first front-end listed
+      runPipeline(pipelines_[i], scan, imu_batch, i == 0);
     }
+    ++scan_count_;
   }
 }
 
-void RadomNode::publishOdometry(const OdometryState &state) {
+void RadomNode::runPipeline(Pipeline &pipeline, const RadarScan &scan,
+                            const std::vector<ImuMeasurement> &imu_batch, bool send_tf) {
+  try {
+    const auto result = pipeline.estimator->process(scan, imu_batch);
+    if (!result) return;
+    const UpdateResult update = pipeline.estimator->lastUpdate();
+    if (update == UpdateResult::kRejected) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "%s: radar velocity rejected by the innovation gate",
+                           pipeline.name.c_str());
+    } else if (update == UpdateResult::kRecovering) {
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "%s: repeated rejections, inflating velocity covariance",
+                            pipeline.name.c_str());
+    }
+    publishOdometry(pipeline, *result, send_tf);
+    publishStats(pipeline, scan.stamp_ns);
+  } catch (const std::exception &e) {
+    RCLCPP_ERROR(this->get_logger(), "%s: estimator failed, resetting: %s",
+                 pipeline.name.c_str(), e.what());
+    pipeline.estimator = std::make_unique<OdometryEstimator>(rio_config_, pipeline.config);
+  }
+}
+
+void RadomNode::publishStats(const Pipeline &pipeline, int64_t stamp_ns) {
+  const FrontendStats &stats = pipeline.estimator->lastStats();
+  const UpdateResult update = pipeline.estimator->lastUpdate();
+
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = pipeline.name;
+  const auto add = [&status](const std::string &key, const std::string &value) {
+    diagnostic_msgs::msg::KeyValue kv;
+    kv.key = key;
+    kv.value = value;
+    status.values.push_back(kv);
+  };
+  add("points", std::to_string(stats.num_points));
+  add("inliers", std::to_string(stats.num_inliers));
+  add("iterations", std::to_string(stats.iterations));
+  add("runtime_us", std::to_string(stats.runtime_us));
+  add("accepted", update == UpdateResult::kAccepted ? "1" : "0");
+  if (stats.velocity.valid) {
+    add("vx", std::to_string(stats.velocity.velocity.x()));
+    add("vy", std::to_string(stats.velocity.velocity.y()));
+    add("vz", std::to_string(stats.velocity.velocity.z()));
+  }
+
+  diagnostic_msgs::msg::DiagnosticArray msg;
+  msg.header.stamp = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
+  msg.status.push_back(status);
+  pipeline.stats_pub->publish(msg);
+}
+
+void RadomNode::publishOdometry(const Pipeline &pipeline, const OdometryState &state,
+                                bool send_tf) {
   const rclcpp::Time stamp(state.stamp_ns, RCL_ROS_TIME);
   const Eigen::Quaterniond q = state.orientation.normalized();
 
@@ -283,9 +358,9 @@ void RadomNode::publishOdometry(const OdometryState &state) {
     }
   }
 
-  odom_pub_->publish(odom_msg);
+  pipeline.odom_pub->publish(odom_msg);
 
-  if (publish_tf_ && tf_broadcaster_) {
+  if (send_tf && publish_tf_ && tf_broadcaster_) {
     geometry_msgs::msg::TransformStamped tf_msg;
     tf_msg.header.stamp = stamp;
     tf_msg.header.frame_id = odom_frame_;

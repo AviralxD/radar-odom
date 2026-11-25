@@ -1,4 +1,4 @@
-"""Official HeRCULES file player + radom + live GT vs estimate visualisation."""
+"""Official HeRCULES file player + radom + live GT vs RANSAC/GNC visualisation."""
 
 import os
 
@@ -50,9 +50,13 @@ def generate_launch_description():
             executable="gt_viz.py",
             name="gt_viz",
             output="screen",
+            # Rendering results.png on Ctrl+C can exceed the default 5 s
+            sigterm_timeout="30",
             parameters=[{
                 "gt_file": PathJoinSubstitution([sequence, "PR_GT", "Continental_gt.txt"]),
                 "results_dir": LaunchConfiguration("results_dir"),
+                # Must match `frontends` in config/topics.yaml
+                "estimators": ["ransac", "gnc"],
             }],
             # A pip-installed matplotlib in ~/.local can clash with the system numpy
             additional_env={"PYTHONNOUSERSITE": "1"},
