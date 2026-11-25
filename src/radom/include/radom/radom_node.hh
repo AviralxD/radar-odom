@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -24,14 +25,22 @@ public:
   RadomNode();
 
 private:
-  // One estimator per front-end; all are fed identical scans and IMU batches
+  // One estimator per configured run; all are fed identical scans and IMU batches
   struct Pipeline {
     std::string name;
-    FrontendConfig config;
+    EstimatorConfig config;
     std::unique_ptr<OdometryEstimator> estimator;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr stats_pub;
   };
+
+  // Declare every estimator setting under `prefix`, falling back to `defaults`
+  EstimatorConfig declareEstimatorConfig(const std::string &prefix,
+                                         const EstimatorConfig &defaults);
+  // YAML may write a number as an integer or a float: accept both
+  double declareNumber(const std::string &name, double fallback);
+  // Reject misspelt per-run settings, which would otherwise be silently ignored
+  void checkOverrides();
 
   void radarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -54,7 +63,7 @@ private:
   bool publish_tf_ = true;
 
   double radar_time_offset_s_ = 0.0;
-  RioConfig rio_config_;
+  std::set<std::string> known_parameters_;
 
   std::mutex mutex_;
   std::deque<ImuMeasurement> imu_buffer_;
@@ -63,6 +72,7 @@ private:
   std::optional<int64_t> last_imu_stamp_ns_;
   std::optional<int64_t> last_radar_stamp_ns_;
   std::vector<Pipeline> pipelines_;
+  std::string tf_run_;
   size_t scan_count_ = 0;
 };
 

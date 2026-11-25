@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Live GT vs estimates visualisation and comparison report for each run.
+"""Live GT vs estimates visualisation and comparison report for each dataset run.
 
-Every estimator listed in `estimators` is drawn against ground truth in RViz.
-After a run, results.png, metrics.csv and per-estimator data files are saved.
+The runs and comparisons come from the experiments file. Each run is drawn
+against ground truth in RViz. After playback a results folder is written with
+results.png (all runs), compare_<name>.png (one per comparison), metrics.csv,
+metrics_full.csv, per-run data files and a copy of the configuration. The
+experiments file chooses the table columns and graphs of each figure.
 """
 
 import csv
 import datetime
+import math
 import os
+import shutil
 import time
 
 import matplotlib
@@ -16,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import rclpy
+import yaml
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
@@ -28,19 +34,47 @@ from scipy.spatial.transform import Rotation, Slerp
 FRAME = "world"  # the GT file's local frame
 RESTART_NS = 500_000_000  # a stamp this far in the past means a dataset restart
 VEL_HALF_WINDOW_S = 0.1  # for differentiating GT positions
-
-# RANSAC is drawn wide and GNC thin on top, so both stay visible where they overlap
-STYLES = {
-    "ransac": {"color": "#d62728", "linewidth": 2.6, "alpha": 0.75},
-    "gnc": {"color": "#1f77b4", "linewidth": 1.2, "alpha": 1.0},
-}
-FALLBACK_STYLE = {"color": "#9467bd", "linewidth": 1.2, "alpha": 1.0}
+DRIFT_SEGMENT_M = 10.0  # distance travelled for the relative error metrics
+PATH_SPACING_M = 0.25  # thins the RViz paths
 STAT_KEYS = ("points", "inliers", "iterations", "runtime_us", "accepted",
-             "vx", "vy", "vz")
+             "vx", "vy", "vz", "match_runtime_us", "matched", "heading_used",
+             "correspondences", "match_yaw_deg")
+
+# Short id used in the experiments file -> (column title, key in metrics())
+TABLE_METRICS = {
+    "horizontal_rmse": ("horizontal\nRMSE [m]", "ATE horizontal RMSE [m]"),
+    "horizontal_final": ("final horizontal\nerror [m]", "final horizontal error [m]"),
+    "yaw_rmse": ("yaw\nRMSE [deg]", "yaw error RMSE [deg]"),
+    "yaw_final": ("final yaw\nerror [deg]", "final yaw error [deg]"),
+    "rmse_3d": ("3D\nRMSE [m]", "ATE 3D RMSE [m]"),
+    "z_final": ("final z\nerror [m]", "final z error [m]"),
+    "drift": ("drift per\n10 m [m]", "drift per 10 m, horizontal [m]"),
+    "drift_yaw": ("yaw drift per\n10 m [deg]", "drift per 10 m, yaw [deg]"),
+    "velocity_rmse": ("velocity\nRMSE [m/s]", "velocity RMSE [m/s]"),
+    "frontend_us": ("front-end\nmedian [us]", "front-end median [us]"),
+    "matcher_ms": ("matcher\nmedian [ms]", "matcher median [ms]"),
+    "inliers": ("mean\ninliers [%]", "mean inliers [%]"),
+}
+# Graph name -> (title, y label)
+PANELS = {
+    "trajectory": ("trajectory (top down, origin-aligned)", "y [m]"),
+    "horizontal_error": ("horizontal position error", "[m]"),
+    "yaw_error": ("yaw error", "[deg]"),
+    "z_error": ("z error", "[m]"),
+    "error_3d": ("3D position error", "[m]"),
+    "horizontal_bars": ("horizontal error RMSE", "[m]"),
+    "yaw_bars": ("yaw error RMSE", "[deg]"),
+    "velocity_error": ("radar velocity error vs GT (1 s median)", "[m/s]"),
+    "frontend_runtime": ("front-end runtime (1 s median)", "[us], log"),
+    "matcher_runtime": ("scan matcher runtime (1 s median)", "[ms]"),
+    "inliers": ("inlier ratio (1 s median)", "[%]"),
+}
+DEFAULT_METRICS = ["horizontal_rmse", "horizontal_final", "yaw_rmse", "yaw_final"]
+DEFAULT_PANELS = ["trajectory", "horizontal_error", "yaw_error"]
 
 
 class Track:
-    """Everything received from one estimator during the current run."""
+    """Everything received from one run during the current playback."""
 
     def __init__(self):
         self.align = None  # (rotation, translation) taking estimate into GT frame
@@ -49,6 +83,7 @@ class Track:
         self.stats = []  # dicts, one per radar scan
         self.path = Path()
         self.path.header.frame_id = FRAME
+        self.path_end = None
 
 
 def rolling_median(values, window=21):
@@ -59,15 +94,108 @@ def rolling_median(values, window=21):
     return np.nanmedian(view, axis=1)
 
 
+def column(track, key):
+    return np.array([row[key] for row in track.stats])
+
+
+def percent(mask_values):
+    """Share of ones among the finite entries, or None if there are none."""
+    finite = mask_values[np.isfinite(mask_values)]
+    return 100.0 * finite.mean() if len(finite) else None
+
+
+def segment_drift(track):
+    """RMSE of horizontal translation and heading change over 10 m segments."""
+    gt = np.array(track.gt)
+    raw = np.array(track.raw)
+    travelled = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(gt[:, :2], axis=0), axis=1))])
+    i = np.arange(0, len(gt), 10)
+    j = np.searchsorted(travelled, travelled[i] + DRIFT_SEGMENT_M)
+    i, j = i[j < len(gt)], j[j < len(gt)]
+    if not len(i):
+        return float("nan"), float("nan")
+
+    def relative(poses):
+        start = Rotation.from_quat(poses[i, 3:7])
+        step = start.inv().apply(poses[j, :3] - poses[i, :3])
+        turn = (start.inv() * Rotation.from_quat(poses[j, 3:7])).as_euler("ZYX")[:, 0]
+        return step, turn
+
+    step_est, turn_est = relative(raw)
+    step_gt, turn_gt = relative(gt)
+    translation = np.linalg.norm((step_est - step_gt)[:, :2], axis=1)
+    turn = np.degrees(np.angle(np.exp(1j * (turn_est - turn_gt))))
+    return (float(np.sqrt(np.mean(translation**2))),
+            float(np.sqrt(np.mean(turn**2))))
+
+
+def metrics(track):
+    """Summary numbers for one run: {label: value or None}."""
+    pos = np.array(track.pos)
+    gt = np.array(track.gt)[:, :3]
+    error = pos - gt
+    horizontal = np.linalg.norm(error[:, :2], axis=1)
+    yaw = np.array(track.yaw_err)
+    drift_t, drift_yaw = segment_drift(track)
+    inlier_pct = 100.0 * column(track, "inliers") / np.maximum(column(track, "points"), 1)
+    match_us = column(track, "match_runtime_us")
+    has_matcher = np.isfinite(match_us).any()
+    return {
+        "ATE horizontal RMSE [m]": float(np.sqrt(np.mean(horizontal**2))),
+        "ATE 3D RMSE [m]": float(np.sqrt(np.mean(np.sum(error**2, axis=1)))),
+        "final horizontal error [m]": float(horizontal[-1]),
+        "final z error [m]": float(error[-1, 2]),
+        "yaw error RMSE [deg]": float(np.sqrt(np.mean(yaw**2))),
+        "final yaw error [deg]": float(yaw[-1]),
+        "drift per 10 m, horizontal [m]": drift_t,
+        "drift per 10 m, yaw [deg]": drift_yaw,
+        "velocity RMSE [m/s]": float(np.sqrt(np.nanmean(column(track, "vel_err")**2))),
+        "front-end median [us]": float(np.median(column(track, "runtime_us"))),
+        "matcher median [ms]":
+            float(np.nanmedian(match_us)) / 1000.0 if has_matcher else None,
+        "matcher p95 [ms]":
+            float(np.nanpercentile(match_us, 95)) / 1000.0 if has_matcher else None,
+        "scans matched [%]": percent(column(track, "matched")),
+        "matched heading used [%]": percent(column(track, "heading_used")),
+        "mean inliers [%]": float(np.mean(inlier_pct)),
+        "scans without velocity update": int(np.sum(column(track, "accepted") == 0)),
+        "scans": len(track.stats),
+    }
+
+
+def format_value(value):
+    if value is None:
+        return "-"
+    if isinstance(value, int):
+        return str(value)
+    return f"{value:.3f}" if abs(value) < 100 else f"{value:.1f}"
+
+
 class GtViz(Node):
     def __init__(self):
         super().__init__("gt_viz")
         gt_file = self.declare_parameter("gt_file", "").value
         namespace = self.declare_parameter("output_namespace", "/radom").value
-        self.names = list(self.declare_parameter("estimators", ["ransac", "gnc"]).value)
+        experiments_file = self.declare_parameter("experiments_file", "").value
+        self.config_files = list(self.declare_parameter("config_files", [""]).value)
         self.results_dir = self.declare_parameter("results_dir", "results").value
-        # Wall-clock silence on the odometry topics after which the run is saved
+        # Wall-clock silence on the odometry topics after which results are saved
         self.idle_save_s = self.declare_parameter("idle_save_s", 5.0).value
+
+        with open(experiments_file) as f:
+            spec = yaml.safe_load(f)
+        self.runs = spec["runs"]
+        self.comparisons = spec.get("comparisons") or {}
+        report = spec.get("report") or {}
+        self.metrics_shown = report.get("metrics", DEFAULT_METRICS)
+        self.panels_shown = report.get("panels", DEFAULT_PANELS)
+        # Fail now rather than after a whole playback
+        for figure in [report, *self.comparisons.values()]:
+            unknown = ([m for m in figure.get("metrics", []) if m not in TABLE_METRICS]
+                       + [p for p in figure.get("panels", []) if p not in PANELS])
+            if unknown:
+                raise ValueError(f"unknown metrics or panels in experiments file: {unknown}")
 
         # Columns: stamp_ns x y z qx qy qz qw. Stamps are parsed as integers so
         # that nanoseconds are not rounded away by a float conversion.
@@ -83,33 +211,33 @@ class GtViz(Node):
         self.gt_path_pub = self.create_publisher(Path, "/radom/viz/gt_path", latched)
         self.gt_pose_pub = self.create_publisher(PoseStamped, "/radom/viz/gt_pose", 10)
         self.path_pubs, self.pose_pubs = {}, {}
-        for name in self.names:
+        for name in self.runs:
             self.path_pubs[name] = self.create_publisher(
                 Path, f"/radom/viz/{name}/path", latched)
             self.pose_pubs[name] = self.create_publisher(
                 PoseStamped, f"/radom/viz/{name}/pose", 10)
             self.create_subscription(
                 Odometry, f"{namespace}/{name}/odom",
-                lambda msg, n=name: self.on_odom(n, msg), 200)
+                lambda msg, n=name: self.on_odom(n, msg), 500)
             self.create_subscription(
                 DiagnosticArray, f"{namespace}/{name}/stats",
-                lambda msg, n=name: self.on_stats(n, msg), 200)
+                lambda msg, n=name: self.on_stats(n, msg), 500)
 
         self.reset_run()
         self.publish_gt_path()
 
         # Steady clock: these must keep ticking when the dataset clock stops
         steady = Clock(clock_type=ClockType.STEADY_TIME)
-        self.create_timer(0.2, self.on_timer, clock=steady)
+        self.create_timer(0.5, self.on_timer, clock=steady)
         self.create_timer(5.0, self.log_error, clock=steady)
         self.get_logger().info(
             f"loaded {len(self.gt_t)} GT poses from {gt_file}, "
-            f"comparing {', '.join(self.names)}")
+            f"comparing {', '.join(self.runs)}")
 
     # ---------------------------------------------------------------- input
 
     def reset_run(self):
-        self.tracks = {name: Track() for name in self.names}
+        self.tracks = {name: Track() for name in self.runs}
         self.last_stamp = {}
         self.run_dir = None
         self.unsaved = False
@@ -175,13 +303,15 @@ class GtViz(Node):
         track.pos.append(est_p)
         track.gt.append(np.concatenate([gt_p, gt_rot.as_quat()]))
         track.pos_err.append(float(np.linalg.norm(est_p - gt_p)))
-        track.yaw_err.append(
-            float((est_rot * gt_rot.inv()).as_euler("ZYX", degrees=True)[0]))
+        yaw = (est_rot * gt_rot.inv()).as_euler("ZYX", degrees=True)[0]
+        track.yaw_err.append(float(yaw))
 
         pose = self.make_pose(est_p, est_rot.as_quat(), msg.header.stamp)
-        track.path.poses.append(pose)
+        if track.path_end is None or np.linalg.norm(est_p - track.path_end) > PATH_SPACING_M:
+            track.path.poses.append(pose)
+            track.path_end = est_p
         self.pose_pubs[name].publish(pose)
-        if name == self.names[0]:
+        if name == next(iter(self.runs)):
             self.gt_pose_pub.publish(
                 self.make_pose(gt_p, gt_rot.as_quat(), msg.header.stamp))
         self.unsaved = True
@@ -193,7 +323,7 @@ class GtViz(Node):
             return
         t = (ns - self.t0_ns) * 1e-9
         values = {kv.key: float(kv.value) for kv in msg.status[0].values}
-        row = {key: values.get(key, np.nan) for key in STAT_KEYS}
+        row = {key: values.get(key, math.nan) for key in STAT_KEYS}
         row["stamp"] = ns
 
         # Radar velocity measurement against differentiated GT, in the radar frame
@@ -227,158 +357,154 @@ class GtViz(Node):
 
     # ---------------------------------------------------------------- report
 
-    def metrics(self, track):
-        """Summary numbers for one estimator, as (label, formatted value) pairs."""
-        pos_err = np.array(track.pos_err)
-        yaw_err = np.array(track.yaw_err)
-        column = {key: np.array([row[key] for row in track.stats])
-                  for key in STAT_KEYS + ("vel_err",)}
-        z_err = track.pos[-1][2] - track.gt[-1][2]
-        inlier_pct = 100.0 * column["inliers"] / np.maximum(column["points"], 1)
-        return [
-            ("ATE RMSE [m]", f"{np.sqrt(np.mean(pos_err**2)):.3f}"),
-            ("final position error [m]", f"{pos_err[-1]:.3f}"),
-            ("yaw error RMSE [deg]", f"{np.sqrt(np.mean(yaw_err**2)):.3f}"),
-            ("final yaw error [deg]", f"{yaw_err[-1]:+.3f}"),
-            ("final z error [m]", f"{z_err:+.3f}"),
-            ("velocity RMSE [m/s]",
-             f"{np.sqrt(np.nanmean(column['vel_err']**2)):.4f}"),
-            ("runtime median [us]", f"{np.median(column['runtime_us']):.1f}"),
-            ("runtime p95 [us]", f"{np.percentile(column['runtime_us'], 95):.1f}"),
-            ("runtime max [us]", f"{np.max(column['runtime_us']):.1f}"),
-            ("mean inliers [%]", f"{np.mean(inlier_pct):.2f}"),
-            ("mean iterations *", f"{np.mean(column['iterations']):.1f}"),
-            ("scans not used by filter", f"{int(np.sum(column['accepted'] == 0))}"),
-            ("scans", f"{len(track.stats)}"),
-        ]
-
-    def write_files(self, tracks):
-        def stamp_text(ns):
-            return f"{ns // 10**9}.{ns % 10**9:09d}"
-
-        def write_tum(path, stamps, rows):
-            with open(path, "w") as f:
+    def write_files(self, tracks, table):
+        def write_tum(filename, stamps, rows):
+            with open(os.path.join(self.run_dir, filename), "w") as f:
                 for ns, row in zip(stamps, rows):
-                    f.write(stamp_text(ns) + " " + " ".join(f"{v:.9f}" for v in row) + "\n")
+                    values = " ".join(f"{v:.9f}" for v in row)
+                    f.write(f"{ns // 10**9}.{ns % 10**9:09d} {values}\n")
 
         longest = max(tracks.values(), key=lambda track: len(track.stamps))
-        write_tum(os.path.join(self.run_dir, "gt.tum"), longest.stamps, longest.gt)
+        write_tum("gt.tum", longest.stamps, longest.gt)
         for name, track in tracks.items():
-            write_tum(os.path.join(self.run_dir, f"est_{name}.tum"),
-                      track.stamps, track.raw)
+            write_tum(f"est_{name}.tum", track.stamps, track.raw)
             with open(os.path.join(self.run_dir, f"stats_{name}.csv"), "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=("stamp",) + STAT_KEYS + ("vel_err",))
                 writer.writeheader()
                 writer.writerows(track.stats)
 
-    def plot(self, tracks, table):
+        # metrics.csv: the short matrix. metrics_full.csv: everything.
+        with open(os.path.join(self.run_dir, "metrics.csv"), "w", newline="") as f:
+            writer = csv.writer(f)
+            keys = [TABLE_METRICS[m][1] for m in self.metrics_shown]
+            writer.writerow(["run"] + keys)
+            for name in tracks:
+                writer.writerow([name] + [format_value(table[name][k]) for k in keys])
+        with open(os.path.join(self.run_dir, "metrics_full.csv"), "w", newline="") as f:
+            writer = csv.writer(f)
+            labels = list(table[next(iter(tracks))])
+            writer.writerow(["run"] + labels)
+            for name in tracks:
+                writer.writerow([name] + [format_value(table[name][k]) for k in labels])
+
+        for path in self.config_files:
+            if os.path.isfile(path):
+                shutil.copy(path, self.run_dir)
+
+    def plot(self, tracks, table, filename, title, metric_ids, panels):
+        """One figure: a table (one row per run) and only the requested graphs."""
+        names = list(tracks)
         t_ref = min(track.stamps[0] for track in tracks.values())
 
         def seconds(stamps):
             return (np.asarray(stamps, dtype=np.int64) - t_ref) * 1e-9
 
         def style(name):
-            return STYLES.get(name, FALLBACK_STYLE)
+            run = self.runs[name]
+            return {"color": run["color"], "linestyle": run.get("linestyle", "-"),
+                    "linewidth": 1.8, "label": run["label"]}
 
-        fig = plt.figure(figsize=(18, 18))
-        grid = fig.add_gridspec(4, 3, height_ratios=[2.6, 1, 1, 1])
+        # Layout: table, then the trajectory across the width, then graph pairs
+        graphs = [p for p in panels if p != "trajectory"]
+        heights = [0.35 * (len(names) + 2.5)]
+        if "trajectory" in panels:
+            heights.append(8.0)
+        heights += [3.8] * ((len(graphs) + 1) // 2)
+        fig = plt.figure(figsize=(15, sum(heights) + 1.0), constrained_layout=True)
+        grid = fig.add_gridspec(len(heights), 2, height_ratios=heights)
 
-        def panel(row, col, title, ylabel):
-            ax = fig.add_subplot(grid[row, col])
-            ax.set_title(title)
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("time [s]")
-            ax.grid(True, alpha=0.4)
-            return ax
+        summary = fig.add_subplot(grid[0, :])
+        summary.axis("off")
+        drawn = summary.table(
+            cellText=[[format_value(table[n][TABLE_METRICS[m][1]]) for m in metric_ids]
+                      for n in names],
+            rowLabels=[self.runs[n]["label"] for n in names],
+            rowColours=[matplotlib.colors.to_rgba(self.runs[n]["color"], 0.45)
+                        for n in names],
+            colLabels=[TABLE_METRICS[m][0] for m in metric_ids],
+            bbox=[0.22, 0.0, 0.78, 1.0])
+        drawn.auto_set_font_size(False)
+        drawn.set_fontsize(11)
+        for (row, _), cell in drawn.get_celld().items():
+            if row == 0:
+                cell.set_height(cell.get_height() * 1.8)
 
-        trajectory = fig.add_subplot(grid[0, :2])
         longest = max(tracks.values(), key=lambda track: len(track.stamps))
         gt = np.array(longest.gt)
-        trajectory.plot(gt[:, 0], gt[:, 1], "k--", linewidth=1.4, label="ground truth")
-        for name, track in tracks.items():
-            pos = np.array(track.pos)
-            trajectory.plot(pos[:, 0], pos[:, 1], label=name.upper(), **style(name))
-        trajectory.plot(*gt[0, :2], "go", markersize=9, label="start")
-        trajectory.set_aspect("equal", adjustable="datalim")
-        trajectory.set_title("trajectory (top down, origin-aligned)")
-        trajectory.set_xlabel("x [m]")
-        trajectory.set_ylabel("y [m]")
-        trajectory.grid(True, alpha=0.4)
-        trajectory.legend()
 
-        summary = fig.add_subplot(grid[0, 2])
-        summary.axis("off")
-        names = list(tracks)
-        labels = [label for label, _ in table[names[0]]]
-        cells = [[table[name][i][1] for name in names] for i in range(len(labels))]
-        drawn = summary.table(
-            cellText=cells, rowLabels=labels, colLabels=[n.upper() for n in names],
-            colColours=[matplotlib.colors.to_rgba(style(n)["color"], 0.35) for n in names],
-            bbox=[0.34, 0.12, 0.66, 0.82])
-        drawn.auto_set_font_size(False)
-        drawn.set_fontsize(10)
-        summary.set_title("summary")
-        summary.text(0.0, 0.04, "* not comparable: RANSAC hypotheses vs GNC weighted solves",
-                     fontsize=9, transform=summary.transAxes)
+        def draw(ax, panel):
+            if panel == "trajectory":
+                ax.plot(gt[:, 0], gt[:, 1], "k:", linewidth=2.0, label="ground truth")
+                for name, track in tracks.items():
+                    pos = np.array(track.pos)
+                    ax.plot(pos[:, 0], pos[:, 1], **style(name))
+                ax.plot(*gt[0, :2], "go", markersize=9, label="start")
+                ax.set_aspect("equal", adjustable="datalim")
+                ax.set_xlabel("x [m]")
+                ax.legend(fontsize=9, loc="center left", bbox_to_anchor=(1.01, 0.5))
+                return
+            if panel in ("horizontal_bars", "yaw_bars"):
+                key = TABLE_METRICS["horizontal_rmse" if panel == "horizontal_bars"
+                                    else "yaw_rmse"][1]
+                for i, name in enumerate(names):
+                    ax.barh(i, table[name][key], color=self.runs[name]["color"])
+                ax.set_yticks(range(len(names)))
+                ax.set_yticklabels([self.runs[n]["label"] for n in names], fontsize=9)
+                ax.invert_yaxis()
+                ax.set_xlabel(PANELS[panel][1])
+                ax.set_ylabel("")
+                return
 
-        position = panel(1, 0, "position error", "[m]")
-        yaw = panel(1, 1, "yaw error", "[deg]")
-        height = panel(1, 2, "z error", "[m]")
-        velocity = panel(2, 0, "radar velocity error vs GT (1 s median)", "[m/s]")
-        runtime = panel(3, 0, "front-end runtime (1 s median)", "[us], log")
-        runtime.set_yscale("log")
-        inliers = panel(3, 2, "inlier ratio (1 s median)", "[%]")
-        histogram = fig.add_subplot(grid[3, 1])
-        histogram.set_title("front-end runtime distribution")
-        histogram.set_xlabel("[us], log")
-        histogram.set_ylabel("scans")
-        histogram.set_xscale("log")
-        histogram.grid(True, alpha=0.4)
+            for name, track in tracks.items():
+                error = np.array(track.pos) - np.array(track.gt)[:, :3]
+                if panel == "horizontal_error":
+                    x, y = track.stamps, np.linalg.norm(error[:, :2], axis=1)
+                elif panel == "yaw_error":
+                    x, y = track.stamps, track.yaw_err
+                elif panel == "z_error":
+                    x, y = track.stamps, error[:, 2]
+                elif panel == "error_3d":
+                    x, y = track.stamps, track.pos_err
+                else:
+                    x = [row["stamp"] for row in track.stats]
+                    if panel == "velocity_error":
+                        y = column(track, "vel_err")
+                    elif panel == "frontend_runtime":
+                        y = column(track, "runtime_us")
+                    elif panel == "matcher_runtime":
+                        y = column(track, "match_runtime_us") / 1000.0
+                        if not np.isfinite(y).any():
+                            continue
+                    else:
+                        y = (100.0 * column(track, "inliers")
+                             / np.maximum(column(track, "points"), 1))
+                    y = rolling_median(y)
+                ax.plot(seconds(x), y, **style(name))
+            if panel == "frontend_runtime":
+                ax.set_yscale("log")
+            ax.set_xlabel("time [s]")
 
-        all_runtimes = np.concatenate(
-            [[row["runtime_us"] for row in track.stats] for track in tracks.values()])
-        bins = np.geomspace(max(all_runtimes.min(), 0.1), all_runtimes.max() * 1.01, 50)
-
-        for name, track in tracks.items():
-            kwargs = dict(style(name), label=name.upper())
-            t = seconds(track.stamps)
-            position.plot(t, track.pos_err, **kwargs)
-            yaw.plot(t, track.yaw_err, **kwargs)
-            height.plot(t, np.array(track.pos)[:, 2] - np.array(track.gt)[:, 2], **kwargs)
-
-            ts = seconds([row["stamp"] for row in track.stats])
-            column = {key: np.array([row[key] for row in track.stats])
-                      for key in ("vel_err", "runtime_us", "inliers", "points")}
-            velocity.plot(ts, rolling_median(column["vel_err"]), **kwargs)
-            runtime.plot(ts, rolling_median(column["runtime_us"]), **kwargs)
-            inliers.plot(ts, rolling_median(
-                100.0 * column["inliers"] / np.maximum(column["points"], 1)), **kwargs)
-            histogram.hist(column["runtime_us"], bins=bins, histtype="step",
-                           color=style(name)["color"], linewidth=1.6, label=name.upper())
-
-        # Direct differences: the error curves often overlap too closely to compare
-        separation = panel(2, 1, "distance between the two estimates", "[m]")
-        measurement = panel(2, 2, "difference between velocity measurements", "[m/s]")
-        if len(names) >= 2:
-            a, b = tracks[names[0]], tracks[names[1]]
-            common, ia, ib = np.intersect1d(a.stamps, b.stamps, return_indices=True)
-            if len(common):
-                gap = np.linalg.norm(np.array(a.pos)[ia] - np.array(b.pos)[ib], axis=1)
-                separation.plot(seconds(common), gap, color="k")
-            va = {row["stamp"]: (row["vx"], row["vy"], row["vz"]) for row in a.stats}
-            vb = {row["stamp"]: (row["vx"], row["vy"], row["vz"]) for row in b.stats}
-            shared = sorted(set(va) & set(vb))
-            if shared:
-                diff = [np.linalg.norm(np.subtract(va[s], vb[s])) for s in shared]
-                measurement.plot(seconds(shared), diff, color="k", linewidth=0.8)
-        for ax in (position, yaw, height, velocity, runtime, inliers, histogram):
-            ax.legend(fontsize=9)
+        row = 1
+        if "trajectory" in panels:
+            cells = [("trajectory", grid[row, :])]
+            row += 1
+        else:
+            cells = []
+        cells += [(p, grid[row + i // 2, i % 2]) for i, p in enumerate(graphs)]
+        for panel, cell in cells:
+            ax = fig.add_subplot(cell)
+            heading, ylabel = PANELS[panel]
+            ax.set_title(heading)
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.4)
+            draw(ax, panel)
+            # One key for the time series when there is no trajectory to carry it
+            if "trajectory" not in panels and panel == graphs[-2 if len(graphs) > 1 else -1]:
+                ax.legend(fontsize=8, ncol=2)
 
         length = np.linalg.norm(np.diff(gt[:, :3], axis=0), axis=1).sum()
-        fig.suptitle(f"{' vs '.join(n.upper() for n in names)} radar-inertial odometry, "
-                     f"GT path {length:.0f} m", fontsize=15)
-        fig.tight_layout(rect=(0, 0, 1, 0.98))
-        fig.savefig(os.path.join(self.run_dir, "results.png"), dpi=100)
+        fig.suptitle(f"{title}  (GT path {length:.0f} m)", fontsize=16)
+        fig.savefig(os.path.join(self.run_dir, filename), dpi=90)
         plt.close(fig)
 
     def save(self):
@@ -388,27 +514,35 @@ class GtViz(Node):
                   if len(track.stamps) >= 2 and track.stats}
         if not tracks:
             return
+        missing = [name for name in self.runs if name not in tracks]
+        if missing:
+            self.get_logger().warn(f"no data from: {', '.join(missing)}")
         if self.run_dir is None:
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             self.run_dir = os.path.join(self.results_dir, stamp)
             os.makedirs(self.run_dir, exist_ok=True)
 
-        table = {name: self.metrics(track) for name, track in tracks.items()}
-        names = list(tracks)
-        rows = [[label] + [table[n][i][1] for n in names]
-                for i, (label, _) in enumerate(table[names[0]])]
-        with open(os.path.join(self.run_dir, "metrics.csv"), "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["metric"] + names)
-            writer.writerows(rows)
-        self.write_files(tracks)
-        self.plot(tracks, table)
+        print("[gt_viz] writing results, please wait ...", flush=True)
+        table = {name: metrics(track) for name, track in tracks.items()}
+        self.write_files(tracks, table)
+        self.plot(tracks, table, "results.png", "All runs",
+                  self.metrics_shown, self.panels_shown)
+        for key, comparison in self.comparisons.items():
+            subset = {n: tracks[n] for n in comparison["runs"] if n in tracks}
+            if len(subset) >= 2:
+                self.plot(subset, table, f"compare_{key}.png",
+                          comparison.get("title", key),
+                          comparison.get("metrics", self.metrics_shown),
+                          comparison.get("panels", self.panels_shown))
 
         self.unsaved = False
         # print() still works once the ROS context has been shut down
-        print(f"[gt_viz] {'metric':<28}" + "".join(f"{n:>12}" for n in names))
-        for row in rows:
-            print(f"[gt_viz] {row[0]:<28}" + "".join(f"{v:>12}" for v in row[1:]))
+        keys = [TABLE_METRICS[m][1] for m in self.metrics_shown]
+        titles = [TABLE_METRICS[m][0].replace("\n", " ") for m in self.metrics_shown]
+        print(f"[gt_viz] {'run':<22}" + "".join(f"{t:>28}" for t in titles))
+        for name in tracks:
+            print(f"[gt_viz] {name:<22}"
+                  + "".join(f"{format_value(table[name][k]):>28}" for k in keys))
         print(f"[gt_viz] saved to {self.run_dir}", flush=True)
 
 

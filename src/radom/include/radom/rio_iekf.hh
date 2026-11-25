@@ -163,6 +163,8 @@ public:
   UpdateResult updateRadarVelocity(const Eigen::Vector3d &v_radar,
                                    const Eigen::Matrix3d &irls_vel_cov,
                                    const Eigen::Vector3d &last_gyro_raw);
+  // Rotate the heading estimate by `correction` [rad], weighted by `std_dev`
+  UpdateResult updateHeading(double correction, double std_dev, double nis_gate);
   void reset();
 
   // IMU body-frame state accessors

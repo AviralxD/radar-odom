@@ -154,6 +154,37 @@ H = MeasurementJacobian::Zero();
   return run(state);
 }
 
+// Scalar update written out because kalmanif cannot form 1-D measurement
+// Jacobians. It follows kalmanif's right-invariant convention.
+UpdateResult RadarInertialFilter::updateHeading(double correction, double std_dev,
+                                                double nis_gate) {
+  if (!initialized_ || !std::isfinite(correction) || std_dev <= 0.0) {
+    return UpdateResult::kInvalid;
+  }
+  using Matrix15 = Eigen::Matrix<double, 15, 15>;
+  using Vector15 = Eigen::Matrix<double, 15, 1>;
+
+  // The right-invariant rotation error is expressed in the world frame, so its
+  // z component (index 5) is the heading error: H = -e_5
+  const Matrix15 P = filter_.getCovariance();
+  const double R = std_dev * std_dev;
+  const double S = P(5, 5) + R;
+  if (correction * correction / S > nis_gate) {
+    return UpdateResult::kRejected;
+  }
+  const Vector15 K = -P.col(5) / S;
+
+  RioState::Tangent dx;
+  dx.coeffs() = -K * correction;
+  filter_.setState(dx + filter_.getState());
+
+  Matrix15 IKH = Matrix15::Identity();
+  IKH.col(5) += K;
+  const Matrix15 updated = IKH * P * IKH.transpose() + R * K * K.transpose();
+  filter_.setCovariance(0.5 * (updated + updated.transpose()));
+  return UpdateResult::kAccepted;
+}
+
 Eigen::Matrix<double, 15, 15> RadarInertialFilter::defaultInitialCovariance() {
   Eigen::Matrix<double, 15, 15> P = Eigen::Matrix<double, 15, 15>::Identity();
   P.block<3, 3>(0, 0) *= 1e-4;    // position [m^2]

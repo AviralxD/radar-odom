@@ -1,6 +1,7 @@
 #include "radom/radom_node.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -14,6 +15,7 @@ namespace {
 // A stamp this far behind the previous one means the dataset restarted
 constexpr int64_t kTimeJumpNs = 500'000'000;
 constexpr size_t kMaxPendingScans = 100;
+constexpr double kDegToRad = M_PI / 180.0;
 
 using sensor_msgs::msg::PointField;
 
@@ -71,59 +73,42 @@ RadomNode::RadomNode() : Node("radom") {
   const auto radar_topic = this->declare_parameter<std::string>("radar_topic", "/continental/points");
   const auto imu_topic = this->declare_parameter<std::string>("imu_topic", "/imu/data_raw");
   const auto output_ns = this->declare_parameter<std::string>("output_namespace", "/radom");
-  const auto frontends = this->declare_parameter<std::vector<std::string>>(
-      "frontends", {"ransac", "gnc"});
   odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
   base_frame_ = this->declare_parameter<std::string>("base_frame", "continental");
   publish_tf_ = this->declare_parameter<bool>("publish_tf", true);
   doppler_field_ = this->declare_parameter<std::string>("doppler_field", "v");
   rcs_field_ = this->declare_parameter<std::string>("rcs_field", "RCS");
-
   radar_time_offset_s_ = this->declare_parameter<double>("radar_time_offset_s", 0.0);
-  const auto vel_std = this->declare_parameter<std::vector<double>>(
-      "radar_vel_std", {rio_config_.radar_vel_std.x(), rio_config_.radar_vel_std.y(),
-                        rio_config_.radar_vel_std.z()});
-  if (vel_std.size() != 3) {
-    throw std::invalid_argument("radar_vel_std must have 3 elements");
+
+  const auto runs = this->declare_parameter<std::vector<std::string>>("runs", {"imu"});
+  if (runs.empty()) {
+    throw std::invalid_argument("`runs` must name at least one pipeline");
   }
-  rio_config_.radar_vel_std = Eigen::Vector3d(vel_std[0], vel_std[1], vel_std[2]);
-  rio_config_.nis_gate = this->declare_parameter<double>("nis_gate", rio_config_.nis_gate);
-  rio_config_.max_consecutive_rejections = static_cast<int>(this->declare_parameter<int>(
-      "max_consecutive_rejections", rio_config_.max_consecutive_rejections));
-  FrontendConfig frontend;
-  frontend.inlier_thresh_mps = this->declare_parameter<double>(
-      "inlier_threshold_mps", frontend.inlier_thresh_mps);
-  frontend.gnc_mu_step = this->declare_parameter<double>("gnc_mu_step", frontend.gnc_mu_step);
-  frontend.gnc_max_iterations = static_cast<int>(this->declare_parameter<int>(
-      "gnc_max_iterations", frontend.gnc_max_iterations));
-  if (frontends.empty() || frontend.inlier_thresh_mps <= 0.0 || frontend.gnc_mu_step <= 1.0) {
-    throw std::invalid_argument(
-        "need at least one front-end, inlier_threshold_mps > 0 and gnc_mu_step > 1");
-  }
-  for (const auto &name : frontends) {
-    if (name != "ransac" && name != "gnc") {
-      throw std::invalid_argument("unknown front-end '" + name + "', use ransac or gnc");
-    }
+  tf_run_ = this->declare_parameter<std::string>("tf_run", runs.front());
+
+  // Settings without a prefix are the defaults shared by every run
+  const EstimatorConfig defaults = declareEstimatorConfig("", EstimatorConfig{});
+  for (const auto &name : runs) {
     Pipeline pipeline;
     pipeline.name = name;
-    pipeline.config = frontend;
-    pipeline.config.type = name == "gnc" ? Frontend::kGnc : Frontend::kRansac;
-    pipeline.estimator = std::make_unique<OdometryEstimator>(rio_config_, pipeline.config);
+    pipeline.config = declareEstimatorConfig(name + ".", defaults);
+    pipeline.estimator = std::make_unique<OdometryEstimator>(pipeline.config);
     pipeline.odom_pub = this->create_publisher<nav_msgs::msg::Odometry>(
         output_ns + "/" + name + "/odom", 50);
     pipeline.stats_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
         output_ns + "/" + name + "/stats", 50);
     pipelines_.push_back(std::move(pipeline));
   }
+  checkOverrides();
 
-  auto sensor_qos = rclcpp::SensorDataQoS();
-
+  // Deep queues: several pipelines may take longer than one radar period, and a
+  // dropped message would change the results
   radar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      radar_topic, sensor_qos,
+      radar_topic, rclcpp::SensorDataQoS().keep_last(100),
       std::bind(&RadomNode::radarCallback, this, std::placeholders::_1));
 
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic, rclcpp::SensorDataQoS().keep_last(200),
+      imu_topic, rclcpp::SensorDataQoS().keep_last(1000),
       std::bind(&RadomNode::imuCallback, this, std::placeholders::_1));
 
   if (publish_tf_) {
@@ -131,9 +116,122 @@ RadomNode::RadomNode() : Node("radom") {
   }
 
   for (const auto &pipeline : pipelines_) {
-    RCLCPP_INFO(this->get_logger(), "radom started: [%s] + [%s] -> [%s/%s/odom]",
-                radar_topic.c_str(), imu_topic.c_str(), output_ns.c_str(),
-                pipeline.name.c_str());
+    const EstimatorConfig &c = pipeline.config;
+    const char *matcher = c.matcher.mode == MatcherMode::kNone ? "none"
+                          : c.matcher.mode == MatcherMode::kScan ? "scan" : "submap";
+    RCLCPP_INFO(this->get_logger(), "run '%s': frontend=%s use_imu=%s matcher=%s -> %s/%s/odom",
+                pipeline.name.c_str(),
+                c.frontend.type == Frontend::kGnc ? "gnc" : "ransac",
+                c.use_imu ? "true" : "false", matcher,
+                output_ns.c_str(), pipeline.name.c_str());
+  }
+}
+
+double RadomNode::declareNumber(const std::string &name, double fallback) {
+  rcl_interfaces::msg::ParameterDescriptor descriptor;
+  descriptor.dynamic_typing = true;
+  const auto value =
+      this->declare_parameter(name, rclcpp::ParameterValue(fallback), descriptor);
+  if (value.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+    return static_cast<double>(value.get<int64_t>());
+  }
+  if (value.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+    return value.get<double>();
+  }
+  throw std::invalid_argument("parameter '" + name + "' must be a number");
+}
+
+EstimatorConfig RadomNode::declareEstimatorConfig(const std::string &prefix,
+                                                  const EstimatorConfig &d) {
+  EstimatorConfig c = d;
+  const auto full = [&](const char *key) {
+    known_parameters_.insert(prefix + key);
+    return prefix + key;
+  };
+  const auto real = [&](const char *key, double fallback) {
+    return declareNumber(full(key), fallback);
+  };
+  const auto integer = [&](const char *key, int fallback) {
+    return static_cast<int>(this->declare_parameter<int>(full(key), fallback));
+  };
+  const auto degrees = [&](const char *key, double fallback_rad) {
+    return real(key, fallback_rad / kDegToRad) * kDegToRad;
+  };
+  // A string parameter restricted to the listed choices; returns its index
+  const auto choice = [&](const char *key, const std::vector<std::string> &options,
+                          size_t fallback) {
+    const auto value = this->declare_parameter<std::string>(full(key), options[fallback]);
+    for (size_t i = 0; i < options.size(); ++i) {
+      if (value == options[i]) return i;
+    }
+    throw std::invalid_argument("parameter '" + prefix + key + "': unknown value '" + value + "'");
+  };
+
+  c.use_imu = this->declare_parameter<bool>(full("use_imu"), d.use_imu);
+
+  c.frontend.type = static_cast<Frontend>(
+      choice("frontend", {"ransac", "gnc"}, static_cast<size_t>(d.frontend.type)));
+  c.frontend.inlier_thresh_mps = real("inlier_threshold_mps", d.frontend.inlier_thresh_mps);
+  c.frontend.gnc_mu_step = real("gnc_mu_step", d.frontend.gnc_mu_step);
+  c.frontend.gnc_max_iterations = integer("gnc_max_iterations", d.frontend.gnc_max_iterations);
+  c.frontend.range_min = real("range_min", d.frontend.range_min);
+  c.frontend.range_max = real("range_max", d.frontend.range_max);
+  c.frontend.rcs_iqr_k = real("rcs_iqr_k", d.frontend.rcs_iqr_k);
+  c.frontend.lambda_z = real("lambda_z", d.frontend.lambda_z);
+  c.frontend.huber_delta = real("huber_delta", d.frontend.huber_delta);
+  c.frontend.irls_iterations = integer("irls_iterations", d.frontend.irls_iterations);
+
+  c.matcher.mode = static_cast<MatcherMode>(
+      choice("matcher", {"none", "scan", "submap"}, static_cast<size_t>(d.matcher.mode)));
+  c.matcher.dof = static_cast<MatcherDof>(
+      choice("matcher_dof", {"yaw", "planar"}, static_cast<size_t>(d.matcher.dof)));
+  c.matcher.submap_size = integer("submap_size", d.matcher.submap_size);
+  c.matcher.keyframe_distance = real("keyframe_distance", d.matcher.keyframe_distance);
+  c.matcher.keyframe_angle = degrees("keyframe_angle_deg", d.matcher.keyframe_angle);
+  c.matcher.sigma_range = real("sigma_range", d.matcher.sigma_range);
+  c.matcher.sigma_azimuth = degrees("sigma_azimuth_deg", d.matcher.sigma_azimuth);
+  c.matcher.max_correspondence_distance =
+      real("max_correspondence_distance", d.matcher.max_correspondence_distance);
+  c.matcher.robust_kernel = real("robust_kernel", d.matcher.robust_kernel);
+  c.matcher.prior_yaw_std = degrees("prior_yaw_std_deg", d.matcher.prior_yaw_std);
+  c.matcher.prior_xy_std = real("prior_xy_std", d.matcher.prior_xy_std);
+  c.matcher.max_iterations = integer("matcher_max_iterations", d.matcher.max_iterations);
+  c.matcher.min_correspondences = integer("min_correspondences", d.matcher.min_correspondences);
+  c.matcher.max_yaw_correction =
+      degrees("max_yaw_correction_deg", d.matcher.max_yaw_correction);
+
+  c.scan_yaw_std = degrees("scan_yaw_std_deg", d.scan_yaw_std);
+  c.scan_yaw_gate = real("scan_yaw_gate", d.scan_yaw_gate);
+
+  const auto vel_std = this->declare_parameter<std::vector<double>>(
+      full("radar_vel_std"),
+      {d.rio.radar_vel_std.x(), d.rio.radar_vel_std.y(), d.rio.radar_vel_std.z()});
+  if (vel_std.size() != 3) {
+    throw std::invalid_argument(prefix + "radar_vel_std must have 3 elements");
+  }
+  c.rio.radar_vel_std = Eigen::Vector3d(vel_std[0], vel_std[1], vel_std[2]);
+  c.rio.nis_gate = real("nis_gate", d.rio.nis_gate);
+  c.rio.max_consecutive_rejections =
+      integer("max_consecutive_rejections", d.rio.max_consecutive_rejections);
+
+  if (c.frontend.inlier_thresh_mps <= 0.0 || c.frontend.gnc_mu_step <= 1.0 ||
+      c.matcher.sigma_range <= 0.0 || c.matcher.prior_yaw_std <= 0.0 ||
+      c.matcher.prior_xy_std <= 0.0 || c.matcher.robust_kernel <= 0.0 ||
+      c.matcher.submap_size < 1 || c.scan_yaw_std <= 0.0) {
+    throw std::invalid_argument("run '" + prefix + "' has an out-of-range setting");
+  }
+  return c;
+}
+
+void RadomNode::checkOverrides() {
+  const auto &all = this->get_node_parameters_interface()->get_parameter_overrides();
+  for (const auto &pipeline : pipelines_) {
+    const std::string prefix = pipeline.name + ".";
+    for (const auto &entry : all) {
+      if (entry.first.rfind(prefix, 0) == 0 && known_parameters_.count(entry.first) == 0) {
+        throw std::invalid_argument("unknown setting '" + entry.first + "'");
+      }
+    }
   }
 }
 
@@ -261,13 +359,13 @@ void RadomNode::processPending() {
     pending_scans_.pop_front();
     const auto imu_batch = takeImuUpTo(scan.stamp_ns);
 
-    // Rotate which front-end runs first, so that warm caches do not
-    // consistently favour one of them in the runtime comparison
+    // Rotate which run goes first, so that warm caches do not consistently
+    // favour one of them in the runtime comparison
     const size_t count = pipelines_.size();
     for (size_t k = 0; k < count; ++k) {
       const size_t i = (scan_count_ + k) % count;
-      // Only one estimator can own the TF: the first front-end listed
-      runPipeline(pipelines_[i], scan, imu_batch, i == 0);
+      // Only one estimator can own the TF
+      runPipeline(pipelines_[i], scan, imu_batch, pipelines_[i].name == tf_run_);
     }
     ++scan_count_;
   }
@@ -278,7 +376,7 @@ void RadomNode::runPipeline(Pipeline &pipeline, const RadarScan &scan,
   try {
     const auto result = pipeline.estimator->process(scan, imu_batch);
     if (!result) return;
-    const UpdateResult update = pipeline.estimator->lastUpdate();
+    const UpdateResult update = pipeline.estimator->lastStats().velocity_update;
     if (update == UpdateResult::kRejected) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                            "%s: radar velocity rejected by the innovation gate",
@@ -293,13 +391,12 @@ void RadomNode::runPipeline(Pipeline &pipeline, const RadarScan &scan,
   } catch (const std::exception &e) {
     RCLCPP_ERROR(this->get_logger(), "%s: estimator failed, resetting: %s",
                  pipeline.name.c_str(), e.what());
-    pipeline.estimator = std::make_unique<OdometryEstimator>(rio_config_, pipeline.config);
+    pipeline.estimator = std::make_unique<OdometryEstimator>(pipeline.config);
   }
 }
 
 void RadomNode::publishStats(const Pipeline &pipeline, int64_t stamp_ns) {
-  const FrontendStats &stats = pipeline.estimator->lastStats();
-  const UpdateResult update = pipeline.estimator->lastUpdate();
+  const EstimatorStats &stats = pipeline.estimator->lastStats();
 
   diagnostic_msgs::msg::DiagnosticStatus status;
   status.name = pipeline.name;
@@ -309,15 +406,22 @@ void RadomNode::publishStats(const Pipeline &pipeline, int64_t stamp_ns) {
     kv.value = value;
     status.values.push_back(kv);
   };
-  add("points", std::to_string(stats.num_points));
-  add("inliers", std::to_string(stats.num_inliers));
-  add("iterations", std::to_string(stats.iterations));
-  add("runtime_us", std::to_string(stats.runtime_us));
-  add("accepted", update == UpdateResult::kAccepted ? "1" : "0");
+  add("points", std::to_string(stats.frontend.num_points));
+  add("inliers", std::to_string(stats.frontend.num_inliers));
+  add("iterations", std::to_string(stats.frontend.iterations));
+  add("runtime_us", std::to_string(stats.frontend.runtime_us));
+  add("accepted", stats.velocity_update == UpdateResult::kAccepted ? "1" : "0");
   if (stats.velocity.valid) {
     add("vx", std::to_string(stats.velocity.velocity.x()));
     add("vy", std::to_string(stats.velocity.velocity.y()));
     add("vz", std::to_string(stats.velocity.velocity.z()));
+  }
+  if (pipeline.config.matcher.mode != MatcherMode::kNone) {
+    add("match_runtime_us", std::to_string(stats.match_runtime_us));
+    add("matched", stats.match.valid ? "1" : "0");
+    add("heading_used", stats.heading_used ? "1" : "0");
+    add("correspondences", std::to_string(stats.match.correspondences));
+    add("match_yaw_deg", std::to_string(stats.match.yaw / kDegToRad));
   }
 
   diagnostic_msgs::msg::DiagnosticArray msg;

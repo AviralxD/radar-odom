@@ -30,6 +30,9 @@ add_executable(radom_node
   src/main.cc
   src/radom_node.cc
   src/odom.cc
+  src/frontend.cc
+  src/scan_matcher.cc
+  src/radar_only.cc
   src/ransac.cc
   src/gnc.cc
   src/rio_iekf.cc

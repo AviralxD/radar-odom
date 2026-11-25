@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -38,5 +39,10 @@ struct OdometryState {
   Eigen::Matrix<double, 6, 6> pose_covariance = Eigen::Matrix<double, 6, 6>::Identity() * 1e-3;
   Eigen::Matrix<double, 6, 6> twist_covariance = Eigen::Matrix<double, 6, 6>::Identity() * 1e-3;
 };
+
+// Heading of the x axis in the world x-y plane
+inline double headingOf(const Eigen::Matrix3d &R) { return std::atan2(R(1, 0), R(0, 0)); }
+
+inline double wrapAngle(double angle) { return std::atan2(std::sin(angle), std::cos(angle)); }
 
 }

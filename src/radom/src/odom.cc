@@ -1,27 +1,61 @@
 #include "radom/odom.hh"
-#include "radom/ransac.hh"
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
 
 namespace radom {
 
+namespace {
+
+double microsecondsSince(const std::chrono::steady_clock::time_point &start) {
+  return std::chrono::duration<double, std::micro>(
+      std::chrono::steady_clock::now() - start).count();
+}
+
+}
+
+OdometryEstimator::OdometryEstimator(const EstimatorConfig &cfg)
+    : cfg_(cfg),
+      frontend_(cfg.frontend),
+      matcher_(cfg.matcher),
+      rio_filter_(cfg.rio) {}
+
+void OdometryEstimator::reset() {
+  rio_filter_.reset();
+  radar_only_.reset();
+  matcher_.reset();
+  has_last_imu_ = false;
+  has_last_scan_ = false;
+}
+
 std::optional<OdometryState> OdometryEstimator::process(
     const RadarScan &scan,
-    const std::vector<ImuMeasurement> &imu_batch) 
+    const std::vector<ImuMeasurement> &imu_batch)
 {
-  // Detect rosbag loop / backward time jump and reset filter state cleanly
+  // Detect rosbag loop / backward time jump and reset cleanly
   if (has_last_scan_ && scan.timestamp < last_scan_time_) {
-    rio_filter_.reset();
-    state_ = OdometryState{};
-    has_last_imu_ = false;
-    has_last_scan_ = false;
+    reset();
   }
+  const double scan_dt = has_last_scan_ ? scan.timestamp - last_scan_time_ : 0.0;
   last_scan_time_ = scan.timestamp;
   has_last_scan_ = true;
-  state_.stamp_ns = scan.stamp_ns;
+  stats_ = EstimatorStats{};
 
+  const bool initialising = cfg_.use_imu && !rio_filter_.isInitialized();
+  const FrontendResult front = initialising ? FrontendResult{} : frontend_.process(scan.points);
+  stats_.frontend = front.stats;
+  stats_.velocity = front.velocity;
+
+  if (!cfg_.use_imu) {
+    return processRadarOnly(scan, front, scan_dt);
+  }
+  return processInertial(scan, imu_batch, front);
+}
+
+std::optional<OdometryState> OdometryEstimator::processInertial(
+    const RadarScan &scan,
+    const std::vector<ImuMeasurement> &imu_batch,
+    const FrontendResult &front)
+{
   // 0. Static IMU alignment warmup
   if (!rio_filter_.isInitialized()) {
     if (!rio_filter_.initializeFromStaticImu(imu_batch)) {
@@ -57,218 +91,76 @@ std::optional<OdometryState> OdometryEstimator::process(
     has_last_imu_ = true;
   }
 
-  // 2. RANSAC or GNC stationary point filtering + IRLS ego-velocity estimation
-  const auto inliers = filterStationaryPoints(scan.points);
-  const auto vel_est = estimateEgoVelocity(inliers);
-  stats_.velocity = vel_est;
-
-  // 3. RIEKF measurement update with lever-arm compensation
-  last_update_ = UpdateResult::kInvalid;
-  if (vel_est.valid) {
-    last_update_ = rio_filter_.updateRadarVelocity(
-        vel_est.velocity, vel_est.covariance, last_gyro_raw_);
+  // 2. RIEKF Doppler velocity update with lever-arm compensation
+  if (front.velocity.valid) {
+    stats_.velocity_update = rio_filter_.updateRadarVelocity(
+        front.velocity.velocity, front.velocity.covariance, last_gyro_raw_);
   }
 
-  // 4. Populate OdometryState in the 4D radar frame for publishing & gt_radar.tum eval
-  state_.position = rio_filter_.radarPosition();
-  state_.orientation = rio_filter_.radarOrientation();
-  state_.linear_velocity = rio_filter_.radarLinearVelocity(last_gyro_raw_);
-  state_.angular_velocity = rio_filter_.radarAngularVelocity(last_gyro_raw_);
-  state_.pose_covariance = rio_filter_.radarPoseCovariance();
-  state_.twist_covariance = rio_filter_.radarTwistCovariance();
-
-  return state_;
-}
-
-std::vector<RadarPoint> OdometryEstimator::sanitizeScan(
-  const std::vector<RadarPoint> &raw,
-  double r_min,
-  double r_max,
-  double iqr_k) 
-{
-  std::vector<RadarPoint> valid;
-  valid.reserve(raw.size());
-  std::vector<float> rcs_vals;
-  rcs_vals.reserve(raw.size());
-
-  for (const auto &pt : raw) {
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z) ||
-        !std::isfinite(pt.doppler) || !std::isfinite(pt.rcs)) {
-      continue;
+  // 3. Optional heading update from scan matching, starting at the filter pose
+  if (matcher_.enabled()) {
+    const auto start = std::chrono::steady_clock::now();
+    stats_.match = matcher_.match(front.inliers, filterRadarPose());
+    if (stats_.match.valid) {
+      stats_.heading_used = rio_filter_.updateHeading(
+          stats_.match.yaw, cfg_.scan_yaw_std, cfg_.scan_yaw_gate) == UpdateResult::kAccepted;
     }
-    const double r = std::hypot(pt.x, pt.y, pt.z);
-    if (r < r_min || r > r_max) continue;
-    valid.push_back(pt);
-    rcs_vals.push_back(pt.rcs);
+    matcher_.addScan(front.inliers, filterRadarPose());
+    stats_.match_runtime_us = microsecondsSince(start);
   }
 
-  if (rcs_vals.size() < 8) return valid;
-
-  const size_t q1_idx = rcs_vals.size() / 4;
-  const size_t q3_idx = (3 * rcs_vals.size()) / 4;
-  std::vector<float> rcs_sorted = rcs_vals;
-  std::sort(rcs_sorted.begin(), rcs_sorted.end());
-  const float q1 = rcs_sorted[q1_idx];
-  const float q3 = rcs_sorted[q3_idx];
-
-  const float min_rcs = q1 - static_cast<float>(iqr_k) * (q3 - q1);
-
-  std::vector<RadarPoint> clean;
-  clean.reserve(valid.size());
-  for (const auto &pt : valid) {
-    if (pt.rcs >= min_rcs) clean.push_back(pt);
-  }
-  return clean;
+  // 4. Publishable state in the 4D radar frame
+  OdometryState state;
+  state.stamp_ns = scan.stamp_ns;
+  state.position = rio_filter_.radarPosition();
+  state.orientation = rio_filter_.radarOrientation();
+  state.linear_velocity = rio_filter_.radarLinearVelocity(last_gyro_raw_);
+  state.angular_velocity = rio_filter_.radarAngularVelocity(last_gyro_raw_);
+  state.pose_covariance = rio_filter_.radarPoseCovariance();
+  state.twist_covariance = rio_filter_.radarTwistCovariance();
+  return state;
 }
 
-std::vector<RadarPoint> OdometryEstimator::filterStationaryPoints(
-  const std::vector<RadarPoint> &raw_points)
+OdometryState OdometryEstimator::processRadarOnly(
+    const RadarScan &scan, const FrontendResult &front, double dt)
 {
-  const auto clean_pts = sanitizeScan(raw_points);
-  stats_ = FrontendStats{};
-  stats_.num_points = static_cast<int>(clean_pts.size());
-  if (clean_pts.size() < 4) return {};
+  // Without a usable velocity, coast on the previous one
+  const Eigen::Vector3d velocity =
+      front.velocity.valid ? front.velocity.velocity : radar_only_.velocity();
+  stats_.velocity_update =
+      front.velocity.valid ? UpdateResult::kAccepted : UpdateResult::kInvalid;
 
-  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-  const auto start = std::chrono::steady_clock::now();
-  const bool ok = frontend_.type == Frontend::kGnc
-                      ? estimateGnc(clean_pts, &velocity)
-                      : estimateRansac(clean_pts, &velocity);
-  stats_.runtime_us = std::chrono::duration<double, std::micro>(
-      std::chrono::steady_clock::now() - start).count();
-  if (!ok) return {};
-
-  // Both front-ends classify inliers by the same rule
-  const double sq_thresh = frontend_.inlier_thresh_mps * frontend_.inlier_thresh_mps;
-  const RANSAC model(clean_pts, /*doppler_sign=*/-1.0);
-  std::vector<RadarPoint> inliers;
-  inliers.reserve(clean_pts.size());
-  for (int i = 0; i < model.num_data(); ++i) {
-    if (model.EvaluateModelOnPoint(velocity, i) < sq_thresh) {
-      inliers.push_back(clean_pts[static_cast<size_t>(i)]);
-    }
+  if (matcher_.enabled()) {
+    const auto start = std::chrono::steady_clock::now();
+    stats_.match = matcher_.match(front.inliers, radar_only_.predict(velocity, dt));
+    stats_.match_runtime_us = microsecondsSince(start);
   }
-  stats_.num_inliers = static_cast<int>(inliers.size());
-  return inliers;
-}
-
-bool OdometryEstimator::estimateRansac(
-  const std::vector<RadarPoint> &pts,
-  Eigen::Vector3d *velocity)
-{
-  RANSAC solver(pts, /*doppler_sign=*/-1.0);
-
-  ransac_lib::LORansacOptions options;
-  options.min_num_iterations_ = 20;
-  options.max_num_iterations_ = 250;
-  options.squared_inlier_threshold_ =
-      frontend_.inlier_thresh_mps * frontend_.inlier_thresh_mps;
-
-  ransac_lib::LocallyOptimizedMSAC<
-      Eigen::Vector3d,
-      std::vector<Eigen::Vector3d>,
-      RANSAC> lomsac;
-
-  ransac_lib::RansacStatistics stats;
-  const int num_inliers = lomsac.EstimateModel(options, solver, velocity, &stats);
-  stats_.iterations = static_cast<int>(stats.num_iterations);
-  return num_inliers >= 3;
-}
-
-bool OdometryEstimator::estimateGnc(
-  const std::vector<RadarPoint> &pts,
-  Eigen::Vector3d *velocity)
-{
-  GncOptions options;
-  options.noise_bound = frontend_.inlier_thresh_mps;
-  options.mu_step = frontend_.gnc_mu_step;
-  options.max_iterations = frontend_.gnc_max_iterations;
-
-  const GncResult result = solveGncTls(pts, /*doppler_sign=*/-1.0, options);
-  stats_.iterations = result.iterations;
-  *velocity = result.velocity;
-  return result.valid;
-}
-
-VelocityEstimate OdometryEstimator::estimateEgoVelocity(
-  const std::vector<RadarPoint> &inliers,
-  double doppler_sign,
-  double lambda_z,
-  double huber_delta,
-  int irls_iters) 
-{
-  VelocityEstimate est;
-  const int n = static_cast<int>(inliers.size());
-  if (n < 3) return est;
-
-  Eigen::MatrixX3d U(n, 3);
-  Eigen::VectorXd y(n);
-  for (int i = 0; i < n; ++i) {
-    const Eigen::Vector3d p(inliers[i].x, inliers[i].y, inliers[i].z);
-    const double norm = p.norm();
-    if (norm <= 1e-6) return est;
-    U.row(i) = (p / norm).transpose();
-    y(i) = doppler_sign * static_cast<double>(inliers[i].doppler);
+  // An invalid match leaves its corrections at zero
+  radar_only_.update(velocity, dt, stats_.match.yaw, stats_.match.xy);
+  stats_.heading_used = stats_.match.valid;
+  if (matcher_.enabled()) {
+    const auto start = std::chrono::steady_clock::now();
+    matcher_.addScan(front.inliers, radar_only_.pose());
+    stats_.match_runtime_us += microsecondsSince(start);
   }
 
-  Eigen::VectorXd weights = Eigen::VectorXd::Ones(n);
-  const Eigen::Matrix3d reg = Eigen::Vector3d(1e-6, 1e-6, lambda_z).asDiagonal();
-
-  Eigen::LDLT<Eigen::Matrix3d> ldlt;
-  Eigen::VectorXd residuals(n);
-
-  for (int iter = 0; iter <= irls_iters; ++iter) {
-    const Eigen::Matrix3d H = U.transpose() * weights.asDiagonal() * U + reg;
-    const Eigen::Vector3d b = U.transpose() * (weights.array() * y.array()).matrix();
-
-    ldlt.compute(H);
-    if (ldlt.info() != Eigen::Success) return est;
-
-    est.velocity = ldlt.solve(b);
-    residuals = U * est.velocity - y;
-
-    if (iter < irls_iters) {
-      for (int i = 0; i < n; ++i) {
-        const double abs_r = std::abs(residuals(i));
-        weights(i) = (abs_r <= huber_delta) ? 1.0 : (huber_delta / abs_r);
-      }
-    }
-  }
-
-  const double dof = static_cast<double>(std::max(1, n - 3));
-  const double sigma2 = (residuals.array().square() * weights.array()).sum() / dof;
-  est.covariance = std::max(sigma2, 1e-6) * ldlt.solve(Eigen::Matrix3d::Identity());
-  est.valid = true;
-  return est;
+  OdometryState state;
+  state.stamp_ns = scan.stamp_ns;
+  state.position = radar_only_.pose().translation();
+  state.orientation = Eigen::Quaterniond(radar_only_.pose().rotation());
+  state.linear_velocity = velocity;
+  state.angular_velocity = Eigen::Vector3d(0.0, 0.0, radar_only_.yawRate());
+  // All zero marks the covariance as unknown: there is no filter behind it
+  state.pose_covariance.setZero();
+  state.twist_covariance.setZero();
+  return state;
 }
 
-void OdometryEstimator::integrateVelocity(
-    const VelocityEstimate &vel_est,
-    double dt) 
-{
-  const Eigen::Matrix3d R_wb = state_.orientation.normalized().toRotationMatrix();
-
-  if (vel_est.valid) {
-    state_.linear_velocity = vel_est.velocity;
-    state_.twist_covariance.topLeftCorner<3, 3>() = vel_est.covariance;
-
-    const Eigen::Vector3d vel_world = R_wb * vel_est.velocity;
-    if (has_valid_vel_) {
-      state_.position += 0.5 * (last_vel_world_ + vel_world) * dt;
-    } else {
-      state_.position += vel_world * dt;
-    }
-    state_.pose_covariance.topLeftCorner<3, 3>() +=
-        R_wb * vel_est.covariance * R_wb.transpose() * (dt * dt);
-
-    last_vel_world_ = vel_world;
-    has_valid_vel_ = true;
-  } else if (has_valid_vel_) {
-    state_.position += last_vel_world_ * dt;
-    const Eigen::Matrix3d cov_body = state_.twist_covariance.topLeftCorner<3, 3>();
-    state_.pose_covariance.topLeftCorner<3, 3>() +=
-        R_wb * cov_body * R_wb.transpose() * (dt * dt);
-  }
+Eigen::Isometry3d OdometryEstimator::filterRadarPose() const {
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.linear() = rio_filter_.radarOrientation().toRotationMatrix();
+  pose.translation() = rio_filter_.radarPosition();
+  return pose;
 }
 
 }

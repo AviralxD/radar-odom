@@ -2,23 +2,57 @@ radom:
   ros__parameters:
     radar_topic: "/continental/points"
     imu_topic: "/imu/data_raw"
-    # Each front-end publishes <output_namespace>/<name>/odom and .../stats.
-    # They run side by side on identical input; the first listed owns the TF.
+    # Each run publishes <output_namespace>/<run>/odom and .../stats
     output_namespace: "/radom"
-    frontends: ["ransac", "gnc"]
-    inlier_threshold_mps: 0.15   # RANSAC threshold and GNC noise bound
-    gnc_mu_step: 1.4
-    gnc_max_iterations: 100
     odom_frame: "odom"
     base_frame: "continental"
     publish_tf: true
     doppler_field: "v"
     rcs_field: "RCS"
 
-    # Added to radar stamps to put them on the IMU clock [s].
+    # Added to radar stamps to put them on the IMU clock [s]. Applies to all runs.
     # Fitted on hercules_parking_04 only; re-check it on other sequences.
     radar_time_offset_s: -0.1
-    # Radar velocity std floor in the radar frame [m/s]
-    radar_vel_std: [0.10, 0.15, 0.20]
+
+    # ---------------------------------------------------------------------------
+    # Defaults for every run. Any of these can be overridden for a single run in
+    # experiments.yaml, which is also where the runs themselves are defined.
+    # ---------------------------------------------------------------------------
+    use_imu: true              # false: radar-only dead reckoning
+    frontend: "ransac"         # ransac | gnc
+    matcher: "none"            # none | scan (previous scan) | submap
+
+    # Front-end
+    inlier_threshold_mps: 0.15 # RANSAC threshold and GNC noise bound
+    gnc_mu_step: 1.4
+    gnc_max_iterations: 100
+    range_min: 1.5
+    range_max: 100.0
+    rcs_iqr_k: 1.0
+    lambda_z: 0.05
+    huber_delta: 0.10
+    irls_iterations: 3
+
+    # Scan matching (2D, on the stationary points)
+    matcher_dof: "planar"      # planar: x, y, heading | yaw: heading only
+    submap_size: 20            # keyframes in the submap
+    keyframe_distance: 0.5     # [m]
+    keyframe_angle_deg: 5.0
+    sigma_range: 0.15          # radar point noise along the beam [m]
+    sigma_azimuth_deg: 1.0     # and across it
+    max_correspondence_distance: 2.0
+    robust_kernel: 2.0
+    prior_yaw_std_deg: 2.0     # trust in the predicted pose
+    prior_xy_std: 0.2
+    matcher_max_iterations: 10
+    min_correspondences: 20
+    max_yaw_correction_deg: 5.0
+
+    # Matched heading as an IEKF measurement (runs with use_imu and a matcher)
+    scan_yaw_std_deg: 2.0
+    scan_yaw_gate: 10.83
+
+    # IEKF radar velocity update
+    radar_vel_std: [0.10, 0.15, 0.20]   # std floor in the radar frame [m/s]
     nis_gate: 16.27
     max_consecutive_rejections: 20

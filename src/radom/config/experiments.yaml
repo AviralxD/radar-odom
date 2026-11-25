@@ -1,0 +1,72 @@
+# Test matrix for hercules_eval.launch.py. Every run receives identical input.
+#
+# A run is a name plus any settings from topics.yaml that differ from the
+# defaults. `label`, `color` and `linestyle` are only used for display.
+# Run names become topic and file names: letters, digits and underscores.
+#
+# Use another file with:  ros2 launch radom hercules_eval.launch.py experiments:=/path/to.yaml
+
+# Four methods, each with both outlier rejection front-ends.
+# In the figures: colour = method, solid = RANSAC, dashed = GNC.
+runs:
+  radar_scan_ransac:
+    {label: "Radar scan-to-scan, RANSAC", color: "#7048c8", linestyle: "-",
+     use_imu: false, matcher: scan, frontend: ransac}
+  radar_scan_gnc:
+    {label: "Radar scan-to-scan, GNC", color: "#b197fc", linestyle: "--",
+     use_imu: false, matcher: scan, frontend: gnc}
+
+  radar_submap_ransac:
+    {label: "Radar scan-to-submap, RANSAC", color: "#d9730d", linestyle: "-",
+     use_imu: false, matcher: submap, frontend: ransac}
+  radar_submap_gnc:
+    {label: "Radar scan-to-submap, GNC", color: "#ffc078", linestyle: "--",
+     use_imu: false, matcher: submap, frontend: gnc}
+
+  imu_ransac:
+    {label: "Radar + IMU, RANSAC", color: "#c92a2a", linestyle: "-",
+     use_imu: true, matcher: none, frontend: ransac}
+  imu_gnc:
+    {label: "Radar + IMU, GNC", color: "#ff8787", linestyle: "--",
+     use_imu: true, matcher: none, frontend: gnc}
+
+  imu_submap_ransac:
+    {label: "Radar + IMU + submap, RANSAC", color: "#1864ab", linestyle: "-",
+     use_imu: true, matcher: submap, frontend: ransac}
+  imu_submap_gnc:
+    {label: "Radar + IMU + submap, GNC", color: "#4dabf7", linestyle: "--",
+     use_imu: true, matcher: submap, frontend: gnc}
+
+# Run whose pose is broadcast on TF
+tf_run: imu_ransac
+
+# What every figure shows unless it says otherwise.
+#
+# metrics (table columns): horizontal_rmse, horizontal_final, yaw_rmse,
+#   yaw_final, rmse_3d, z_final, drift, drift_yaw, velocity_rmse,
+#   frontend_us, matcher_ms, inliers
+# panels (graphs): trajectory, horizontal_error, yaw_error, z_error, error_3d,
+#   horizontal_bars, yaw_bars, velocity_error, frontend_runtime,
+#   matcher_runtime, inliers
+report:
+  metrics: [horizontal_rmse, horizontal_final, yaw_rmse, yaw_final]
+  panels: [trajectory, horizontal_error, yaw_error]
+
+# results.png shows all runs with the settings above. Each comparison below gets
+# its own figure, compare_<name>.png, and may override `metrics` and `panels`.
+comparisons:
+  imu_vs_no_imu:
+    title: "IMU vs no IMU (both scan-to-submap)"
+    runs: [radar_submap_ransac, radar_submap_gnc, imu_submap_ransac, imu_submap_gnc]
+  submap_with_imu:
+    title: "Adding scan-to-submap to radar + IMU"
+    runs: [imu_ransac, imu_gnc, imu_submap_ransac, imu_submap_gnc]
+  submap_vs_scan:
+    title: "Scan-to-submap vs scan-to-scan (radar only)"
+    runs: [radar_scan_ransac, radar_scan_gnc, radar_submap_ransac, radar_submap_gnc]
+  ransac_vs_gnc:
+    title: "RANSAC vs GNC"
+    runs: [radar_scan_ransac, radar_scan_gnc, radar_submap_ransac, radar_submap_gnc,
+           imu_ransac, imu_gnc, imu_submap_ransac, imu_submap_gnc]
+    metrics: [horizontal_rmse, yaw_rmse, frontend_us, inliers]
+    panels: [horizontal_bars, yaw_bars, frontend_runtime, inliers]
