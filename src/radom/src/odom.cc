@@ -8,38 +8,72 @@ namespace radom {
 
 std::optional<OdometryState> OdometryEstimator::process(
     const RadarScan &scan,
-    const std::vector<ImuMeasurement> &imu_batch) {
-  (void)imu_batch;
+    const std::vector<ImuMeasurement> &imu_batch) 
+{
+  // Detect rosbag loop / backward time jump and reset filter state cleanly
+  if (has_last_scan_ && scan.timestamp < last_scan_time_) {
+    rio_filter_.reset();
+    state_ = OdometryState{};
+    has_last_imu_ = false;
+    has_last_scan_ = false;
+  }
+  last_scan_time_ = scan.timestamp;
+  has_last_scan_ = true;
   state_.stamp_ns = scan.stamp_ns;
 
-  // 1. RANSAC Filtering of stationary RADAR points
-  const auto inliers = filterStationaryPoints(scan.points);
-
-  // 2. LSQ estimation of ego velocity
-  const auto vel_est = estimateEgoVelocity(inliers);
-
-  // 3. Velocity integration to find position
-  if (!initialized_) {
-    last_scan_time_ = scan.timestamp;
-    initialized_ = true;
-    integrateVelocity(vel_est, 0.0);
-    return state_;
-  }
-
-  const double dt = scan.timestamp - last_scan_time_;
-  last_scan_time_ = scan.timestamp;
-  if (dt <= 0.0 || dt > 1.0) {
-    has_valid_vel_ = false;
+  // 0. Static IMU alignment warmup
+  if (!rio_filter_.isInitialized()) {
+    if (!rio_filter_.initializeFromStaticImu(imu_batch)) {
+      return std::nullopt;
+    }
+    if (!imu_batch.empty()) {
+      last_imu_time_ = imu_batch.back().timestamp;
+      last_gyro_raw_ = imu_batch.back().angular_vel;
+      last_accel_raw_ = imu_batch.back().linear_accel;
+      has_last_imu_ = true;
+    }
     return std::nullopt;
   }
 
-  integrateVelocity(vel_est, dt);
+  // 1. High-rate IMU strap-down propagation across batch
+  for (const auto &imu : imu_batch) {
+    if (has_last_imu_) {
+      const double dt = imu.timestamp - last_imu_time_;
+      if (dt > 0.0 && dt < 0.5) {
+        const Eigen::Vector3d gyro_mid =
+            0.5 * (imu.angular_vel + last_gyro_raw_);
+        const Eigen::Vector3d accel_mid =
+            0.5 * (imu.linear_accel + last_accel_raw_);
+        ImuMeasurement midpoint = imu;
+        midpoint.angular_vel = gyro_mid;
+        midpoint.linear_accel = accel_mid;
+        rio_filter_.propagateImu(midpoint, dt);
+      }
+    }
+    last_imu_time_ = imu.timestamp;
+    last_gyro_raw_ = imu.angular_vel;
+    last_accel_raw_ = imu.linear_accel;
+    has_last_imu_ = true;
+  }
 
-  // TODO:
-  // 4. Kalman filtering with IMU data
-  // 5. GNC outlier rejection
-  (void)inliers;
-  (void)imu_batch;
+  // 2. RANSAC stationary point filtering + IRLS 4D radar ego-velocity estimation
+  const auto inliers = filterStationaryPoints(scan.points);
+  const auto vel_est = estimateEgoVelocity(inliers);
+
+  // 3. RIEKF measurement update with lever-arm compensation
+  last_update_ = UpdateResult::kInvalid;
+  if (vel_est.valid) {
+    last_update_ = rio_filter_.updateRadarVelocity(
+        vel_est.velocity, vel_est.covariance, last_gyro_raw_);
+  }
+
+  // 4. Populate OdometryState in the 4D radar frame for publishing & gt_radar.tum eval
+  state_.position = rio_filter_.radarPosition();
+  state_.orientation = rio_filter_.radarOrientation();
+  state_.linear_velocity = rio_filter_.radarLinearVelocity(last_gyro_raw_);
+  state_.angular_velocity = rio_filter_.radarAngularVelocity(last_gyro_raw_);
+  state_.pose_covariance = rio_filter_.radarPoseCovariance();
+  state_.twist_covariance = rio_filter_.radarTwistCovariance();
 
   return state_;
 }
@@ -70,10 +104,10 @@ std::vector<RadarPoint> OdometryEstimator::sanitizeScan(
 
   const size_t q1_idx = rcs_vals.size() / 4;
   const size_t q3_idx = (3 * rcs_vals.size()) / 4;
-  std::nth_element(rcs_vals.begin(), rcs_vals.begin() + q1_idx, rcs_vals.end());
-  const float q1 = rcs_vals[q1_idx];
-  std::nth_element(rcs_vals.begin() + q1_idx, rcs_vals.begin() + q3_idx, rcs_vals.end());
-  const float q3 = rcs_vals[q3_idx];
+  std::vector<float> rcs_sorted = rcs_vals;
+  std::sort(rcs_sorted.begin(), rcs_sorted.end());
+  const float q1 = rcs_sorted[q1_idx];
+  const float q3 = rcs_sorted[q3_idx];
 
   const float min_rcs = q1 - static_cast<float>(iqr_k) * (q3 - q1);
 

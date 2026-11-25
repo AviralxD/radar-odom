@@ -14,20 +14,33 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-set(RANSACLIB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../extern/ransac-lib")
+set(EXTERN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../extern")
+set(RANSACLIB_INCLUDE_DIR "${EXTERN_DIR}/ransac-lib")
+set(MANIF_INCLUDE_DIR "${EXTERN_DIR}/manif/include")
+set(MANIF_OPTIONAL_INCLUDE_DIR "${EXTERN_DIR}/manif/external/optional/include")
+set(KALMANIF_INCLUDE_DIR "${EXTERN_DIR}/kalmanif/include")
 
 add_executable(radom_node
   src/main.cc
   src/radom_node.cc
   src/odom.cc
   src/ransac.cc
+  src/rio_iekf.cc
 )
+
+target_compile_features(radom_node PUBLIC cxx_std_17)
 
 target_include_directories(radom_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+)
+
+target_include_directories(radom_node SYSTEM PUBLIC
   ${EIGEN3_INCLUDE_DIRS}
-  ${RANSACLIB_INCLUDE_DIR}
+  $<BUILD_INTERFACE:${RANSACLIB_INCLUDE_DIR}>
+  $<BUILD_INTERFACE:${MANIF_INCLUDE_DIR}>
+  $<BUILD_INTERFACE:${MANIF_OPTIONAL_INCLUDE_DIR}>
+  $<BUILD_INTERFACE:${KALMANIF_INCLUDE_DIR}>
 )
 
 ament_target_dependencies(radom_node
@@ -41,6 +54,7 @@ ament_target_dependencies(radom_node
 
 install(TARGETS radom_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
-install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/gt_viz.py DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

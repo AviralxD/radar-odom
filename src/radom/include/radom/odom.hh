@@ -4,6 +4,7 @@
 #include <optional>
 #include <vector>
 
+#include "radom/rio_iekf.hh"
 #include "radom/types.hh"
 
 namespace radom {
@@ -16,11 +17,14 @@ struct VelocityEstimate {
 
 class OdometryEstimator {
 public:
-  OdometryEstimator() = default;
+  explicit OdometryEstimator(const RioConfig &cfg = RioConfig{}) : rio_filter_(cfg) {}
 
   std::optional<OdometryState> process(
       const RadarScan &scan,
       const std::vector<ImuMeasurement> &imu_batch);
+
+  // Outcome of the radar update in the most recent process() call
+  UpdateResult lastUpdate() const { return last_update_; }
 
 private:
   std::vector<RadarPoint> sanitizeScan(
@@ -42,11 +46,17 @@ private:
 
   void integrateVelocity(const VelocityEstimate &vel_est, double dt);
 
+  RadarInertialFilter rio_filter_;
+  UpdateResult last_update_ = UpdateResult::kInvalid;
   OdometryState state_;
+  Eigen::Vector3d last_gyro_raw_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d last_accel_raw_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d last_vel_world_ = Eigen::Vector3d::Zero();
-  bool initialized_ = false;
   bool has_valid_vel_ = false;
+  double last_imu_time_ = 0.0;
   double last_scan_time_ = 0.0;
+  bool has_last_imu_ = false;
+  bool has_last_scan_ = false;
 };
 
-}
+} 

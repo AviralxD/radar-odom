@@ -1,0 +1,68 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Global Options:
+    Fixed Frame: world
+    Background Color: 30; 30; 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (10 m)
+      Enabled: true
+      Cell Size: 10
+      Plane Cell Count: 40
+    - Class: rviz_default_plugins/Path
+      Name: Ground truth
+      Enabled: true
+      Color: 60; 220; 90
+      Line Style: Billboards
+      Line Width: 0.4
+      Topic:
+        Value: /radom/viz/gt_path
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Estimate
+      Enabled: true
+      Color: 255; 70; 70
+      Line Style: Billboards
+      Line Width: 0.4
+      Topic:
+        Value: /radom/viz/est_path
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Pose
+      Name: Ground truth now
+      Enabled: true
+      Color: 60; 220; 90
+      Shape: Arrow
+      Shaft Length: 3
+      Shaft Radius: 0.4
+      Head Length: 1.2
+      Head Radius: 0.9
+      Topic:
+        Value: /radom/viz/gt_pose
+        Depth: 5
+    - Class: rviz_default_plugins/Pose
+      Name: Estimate now
+      Enabled: true
+      Color: 255; 70; 70
+      Shape: Arrow
+      Shaft Length: 3
+      Shaft Radius: 0.4
+      Head Length: 1.2
+      Head Radius: 0.9
+      Topic:
+        Value: /radom/viz/est_pose
+        Depth: 5
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Top down
+      Scale: 6
+      X: 0
+      Y: 0

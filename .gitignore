@@ -4,3 +4,4 @@ src/build
 src/.vscode
 rosbag*
 dataset
+gemini_conversation

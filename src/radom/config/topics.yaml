@@ -4,7 +4,15 @@ radom:
     imu_topic: "/imu/data_raw"
     odom_topic: "/radom/odom"
     odom_frame: "odom"
-    base_frame: "base_link"
+    base_frame: "continental"
     publish_tf: true
     doppler_field: "v"
-    rcs_field: "rcs"
+    rcs_field: "RCS"
+
+    # Added to radar stamps to put them on the IMU clock [s].
+    # Fitted on hercules_parking_04 only; re-check it on other sequences.
+    radar_time_offset_s: -0.1
+    # Radar velocity std floor in the radar frame [m/s]
+    radar_vel_std: [0.10, 0.15, 0.20]
+    nis_gate: 16.27
+    max_consecutive_rejections: 20

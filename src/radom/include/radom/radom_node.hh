@@ -3,6 +3,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include <nav_msgs/msg/odometry.hpp>
@@ -24,6 +25,9 @@ private:
   void radarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void publishOdometry(const OdometryState &state);
+  // Run every queued scan that the IMU stream has caught up with (mutex_ held)
+  void processPending();
+  std::vector<ImuMeasurement> takeImuUpTo(int64_t stamp_ns);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr radar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
@@ -36,9 +40,16 @@ private:
   std::string rcs_field_;
   bool publish_tf_ = true;
 
-  std::mutex imu_mutex_;
+  double radar_time_offset_s_ = 0.0;
+  RioConfig rio_config_;
+
+  std::mutex mutex_;
   std::deque<ImuMeasurement> imu_buffer_;
-  OdometryEstimator estimator_;
+  std::deque<RadarScan> pending_scans_;
+  std::optional<ImuMeasurement> prev_imu_;  // last sample handed to the estimator
+  std::optional<int64_t> last_imu_stamp_ns_;
+  std::optional<int64_t> last_radar_stamp_ns_;
+  std::unique_ptr<OdometryEstimator> estimator_;
 };
 
 }
