@@ -70,7 +70,25 @@ def rviz_config(template_path, runs):
     return write_temp(".rviz", config)
 
 
+def ground_truth(context):
+    """GT file to evaluate against, and a short name for its sequence."""
+    gt_dir = os.path.abspath(os.path.expanduser(
+        LaunchConfiguration("gt_dir").perform(context)))
+    gt_file = os.path.join(gt_dir, "Continental_gt.txt")  # radar frame
+    folder = os.path.basename(gt_dir)
+    name = os.path.basename(os.path.dirname(gt_dir)) if folder == "PR_GT" else folder
+    return gt_file, name
+
+
+def check_ground_truth(context):
+    gt_file, _ = ground_truth(context)
+    if not os.path.isfile(gt_file):
+        raise RuntimeError(f"no ground truth at {gt_file} (set gt_dir:= or sequence:=)")
+    return []
+
+
 def visualisation(context):
+    gt_file, sequence_name = ground_truth(context)
     share = get_package_share_directory("radom")
     spec = resolve_experiments(LaunchConfiguration("experiments").perform(context))
     return [
@@ -82,8 +100,8 @@ def visualisation(context):
             # Rendering the figures on Ctrl+C takes longer than the default 5 s
             sigterm_timeout="60",
             parameters=[{
-                "gt_file": PathJoinSubstitution(
-                    [LaunchConfiguration("sequence"), "PR_GT", "Continental_gt.txt"]),
+                "gt_file": gt_file,
+                "sequence_name": sequence_name,
                 "results_dir": LaunchConfiguration("results_dir"),
                 "experiments_file": write_temp(".yaml", spec),
                 # Saved next to the results so a run can be reproduced
@@ -109,10 +127,16 @@ def generate_launch_description():
     share = get_package_share_directory("radom")
 
     return LaunchDescription([
-        # Must match the folder selected with "Load" in the player GUI
+        # The ground truth must belong to the folder selected with "Load" in the
+        # player GUI. Set `sequence`, or `gt_dir` if the GT is kept elsewhere.
         DeclareLaunchArgument(
             "sequence",
-            default_value=os.path.expanduser("~/radom_ws/dataset/hercules_parking_04")),
+            default_value=os.path.expanduser("~/radom_ws/dataset/hercules_parking_04"),
+            description="Sequence folder"),
+        DeclareLaunchArgument(
+            "gt_dir",
+            default_value=PathJoinSubstitution([LaunchConfiguration("sequence"), "PR_GT"]),
+            description="Folder containing Continental_gt.txt"),
         DeclareLaunchArgument(
             "results_dir",
             default_value=os.path.expanduser("~/radom_ws/dataset/results")),
@@ -122,6 +146,7 @@ def generate_launch_description():
             "experiments", default_value=os.path.join(share, "config", "experiments.yaml")),
         DeclareLaunchArgument("player", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
+        OpaqueFunction(function=check_ground_truth),
 
         # Unmodified official player; only the sensors radom needs are enabled
         Node(
