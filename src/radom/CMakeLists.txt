@@ -66,6 +66,10 @@ ament_target_dependencies(radom_node
 install(TARGETS radom_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
-install(PROGRAMS scripts/gt_viz.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS
+  scripts/gt_viz.py
+  scripts/outlier_injector.py
+  scripts/outlier_report.py
+  DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

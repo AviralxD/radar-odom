@@ -14,6 +14,7 @@ struct RadarPoint {
   double z = 0.0;
   float doppler = 0.0f;
   float rcs = 0.0f;
+  bool injected = false;  // synthetic outlier, set only by the outlier ablation
 };
 
 struct RadarScan {

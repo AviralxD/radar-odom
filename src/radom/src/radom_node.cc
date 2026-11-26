@@ -16,6 +16,8 @@ namespace {
 constexpr int64_t kTimeJumpNs = 500'000'000;
 constexpr size_t kMaxPendingScans = 100;
 constexpr double kDegToRad = M_PI / 180.0;
+// Optional per-point label from outlier_injector.py; non-zero marks a synthetic outlier
+constexpr const char *kInjectedField = "injected";
 
 using sensor_msgs::msg::PointField;
 
@@ -271,6 +273,7 @@ void RadomNode::radarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
   const auto *fz = findField(*msg, "z");
   const auto *fd = findField(*msg, doppler_field_);
   const auto *fr = findField(*msg, rcs_field_);
+  const auto *fi = findField(*msg, kInjectedField);
 
   const size_t num_points = static_cast<size_t>(msg->width) * msg->height;
 
@@ -285,6 +288,7 @@ void RadomNode::radarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
     return;
   }
   const bool has_rcs = readable(*msg, fr);
+  const bool has_label = readable(*msg, fi);
   if (!has_rcs) {
     RCLCPP_WARN_ONCE(this->get_logger(), "no usable '%s' field, RCS filtering is off",
                      rcs_field_.c_str());
@@ -307,6 +311,7 @@ void RadomNode::radarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
       pt.z = readValue(data, *fz);
       pt.doppler = static_cast<float>(readValue(data, *fd));
       if (has_rcs) pt.rcs = static_cast<float>(readValue(data, *fr));
+      if (has_label) pt.injected = readValue(data, *fi) != 0.0;
       scan.points.push_back(pt);
     }
   }
@@ -411,6 +416,8 @@ void RadomNode::publishStats(const Pipeline &pipeline, int64_t stamp_ns) {
   add("iterations", std::to_string(stats.frontend.iterations));
   add("runtime_us", std::to_string(stats.frontend.runtime_us));
   add("accepted", stats.velocity_update == UpdateResult::kAccepted ? "1" : "0");
+  add("injected_points", std::to_string(stats.frontend.injected_points));
+  add("injected_inliers", std::to_string(stats.frontend.injected_inliers));
   if (stats.velocity.valid) {
     add("vx", std::to_string(stats.velocity.velocity.x()));
     add("vy", std::to_string(stats.velocity.velocity.y()));

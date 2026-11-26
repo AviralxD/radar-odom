@@ -1,0 +1,25 @@
+# Outlier ablation (outlier_ablation.launch.py), separate from experiments.yaml.
+#
+# At each level, that share of every radar scan's points is replaced by
+# outliers; the number of points does not change. All levels run in parallel
+# on the same playback, each in its own radom_node. See outlier_injector.py.
+
+levels: [20, 50, 70, 75, 80, 85, 90]  # [%]; the clean scans (0 %) also run, as a reference
+trajectory_level: 80              # drawn as a trajectory figure
+seed: 0
+
+outliers:
+  # Share of the replaced points per kind
+  mix: {multipath: 0.4, moving: 0.4, clutter: 0.2}
+  multipath_factor: 2.0           # double bounce: range and Doppler x 2
+  moving_objects: [1, 3]          # objects per scan, min and max
+  object_speed_mps: [2.0, 10.0]   # each object's speed, uniform
+  object_size_m: 3.0              # range extent of an object
+
+# Settings shared by both methods; anything from topics.yaml can be set here
+common: {use_imu: true, matcher: submap}
+
+# One run per method at every level
+methods:
+  ransac: {label: "RANSAC", color: "#257de0", frontend: ransac}
+  gnc: {label: "GNC", color: "#f47230", frontend: gnc}

@@ -18,6 +18,8 @@ FrontendResult RadarFrontend::process(const std::vector<RadarPoint> &raw_points)
   FrontendResult result;
   const auto clean_pts = sanitizeScan(raw_points);
   result.stats.num_points = static_cast<int>(clean_pts.size());
+  result.stats.injected_points = static_cast<int>(std::count_if(
+      clean_pts.begin(), clean_pts.end(), [](const RadarPoint &p) { return p.injected; }));
   if (clean_pts.size() < 4) return result;
 
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
@@ -36,6 +38,7 @@ FrontendResult RadarFrontend::process(const std::vector<RadarPoint> &raw_points)
   for (int i = 0; i < model.num_data(); ++i) {
     if (model.EvaluateModelOnPoint(velocity, i) < sq_thresh) {
       result.inliers.push_back(clean_pts[static_cast<size_t>(i)]);
+      result.stats.injected_inliers += clean_pts[static_cast<size_t>(i)].injected ? 1 : 0;
     }
   }
   result.stats.num_inliers = static_cast<int>(result.inliers.size());

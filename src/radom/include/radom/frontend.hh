@@ -35,6 +35,9 @@ struct FrontendStats {
   int num_inliers = 0;
   int iterations = 0;    // RANSAC hypotheses, or GNC weighted solves
   double runtime_us = 0.0;  // robust estimator only
+  // Synthetic outliers (outlier ablation) among the points and the inliers
+  int injected_points = 0;
+  int injected_inliers = 0;
 };
 
 struct FrontendResult {
