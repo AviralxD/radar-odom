@@ -2,6 +2,9 @@
 
 A ROS 2 Humble package for 4D radar and radar-inertial odometry, evaluated on the HeRCULES dataset (Continental ARS548 radar + Xsens IMU).
 
+![mountain_01 radar camera side by side](docs/images/hercules_mountain_01_1724812726603387090.png)
+
+
 ## Methods
 
 - **Ego-velocity:** from radar Doppler, with outlier rejection using **RANSAC** or **GNC**.
@@ -10,7 +13,25 @@ A ROS 2 Humble package for 4D radar and radar-inertial odometry, evaluated on th
   - **scan-to-submap:** the same matching against a submap of recent keyframes.
 - **Radar + IMU:** a right-invariant EKF on SE_2(3) (manif/kalmanif). The IMU propagates the state; Doppler velocity and, optionally, scan-to-submap pose updates correct it.
 
+The mathematics of every stage, and how it maps onto the code, is in [docs/radar_odometry.md](docs/radar_odometry.md).
+
 Every combination is listed in `src/radom/config/experiments.yaml`. All of them run side by side on identical input and are scored live against PR_GT.
+
+## Overview 
+
+```mermaid
+flowchart LR
+    R[Radar scan<br/>x y z, Doppler, RCS] --> F[Pre-filter<br/>range + RCS]
+    F --> O{Outlier rejection<br/>RANSAC or GNC}
+    O -->|stationary points| L[IRLS least squares<br/>ego-velocity + covariance]
+    O -->|stationary points| M[Scan matcher<br/>scan-to-scan / scan-to-submap]
+    I[IMU 100 Hz] --> P[IEKF propagation]
+    L -->|velocity update| U[IEKF]
+    M -->|heading update| U
+    P --> U
+    L -.radar only.-> D[Planar dead reckoning]
+    M -.radar only.-> D
+```
 
 ## Setup
 
